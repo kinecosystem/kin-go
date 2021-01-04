@@ -1,0 +1,14 @@
+version: "3"
+services:
+    agora-test-handler:
+        image: "agora-whitelister"
+        restart: always
+        environment:
+            - "ENVIRONMENT=test"
+              # Whitelist seed the webhook will sign with.
+            - "WHITELIST_SEED=SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+              # The webhook secret configured with Agora.
+              # Agora will sign all requests with this seed
+            - "WEBHOOK_SECRET=xxxxxxxxxxxxxxxxxxxx"
+        ports:
+            - "8080:8080"
