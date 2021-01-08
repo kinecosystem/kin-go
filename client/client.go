@@ -73,12 +73,16 @@ type Client interface {
 	//
 	// The batch may be done in on or more transactions.
 	SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...SolanaOption) (result EarnBatchResult, err error)
+
+	// Requests an airdrop of Kin to a Kin token account. Only available on the Kin 4 test environment.
+	RequestAirdrop(ctx context.Context, publicKey kin.PublicKey, quarks uint64, opts ...SolanaOption) (txID []byte, err error)
 }
 
 type client struct {
 	internal *InternalClient
 	opts     clientOpts
 
+	env          Environment
 	network      build.Network
 	accountCache *lru.Cache
 }
@@ -281,6 +285,7 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 	default:
 		return nil, errors.Errorf("unknown environment: %s", env)
 	}
+	c.env = env
 
 	if c.opts.kinVersion == 2 {
 		kinIssuer, err := kin.PublicKeyFromString(issuer)
@@ -675,6 +680,19 @@ func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...S
 	}
 
 	return result, err
+}
+
+func (c *client) RequestAirdrop(ctx context.Context, publicKey kin.PublicKey, quarks uint64, opts ...SolanaOption) ([]byte, error) {
+	if c.env != EnvironmentTest || c.opts.kinVersion != version.KinVersion4 {
+		return nil, errors.New("only available on the Kin 4 test environment")
+	}
+
+	solanaOpts := solanaOpts{commitment: c.opts.defaultCommitment}
+	for _, o := range opts {
+		o(&solanaOpts)
+	}
+
+	return c.internal.RequestAirdrop(ctx, publicKey, quarks, solanaOpts.commitment)
 }
 
 func (c *client) submitPaymentWithResolution(ctx context.Context, payment Payment, solanaOpts solanaOpts) (result SubmitTransactionResult, err error) {

@@ -1799,3 +1799,51 @@ func TestClient_SubmitPaymentMigration(t *testing.T) {
 	assert.EqualValues(t, sender.Public(), transferInstr.Owner)
 	assert.EqualValues(t, p.Quarks, transferInstr.Amount)
 }
+
+func TestClient_RequestAirdropWrongVersion(t *testing.T) {
+	env, cleanup := setup(t, WithDesiredKinVersion(3))
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+
+	txID, err := env.client.RequestAirdrop(context.Background(), priv.Public(), 2)
+	assert.Error(t, err)
+	assert.Nil(t, txID)
+}
+
+func TestClient_RequestAirdropWrongEnv(t *testing.T) {
+	env, cleanup := setup(t, WithDesiredKinVersion(4))
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+
+	env.client.env = EnvironmentProd
+	txID, err := env.client.RequestAirdrop(context.Background(), priv.Public(), 2)
+	assert.Error(t, err)
+	assert.Nil(t, txID)
+}
+
+func TestClient_RequestAirdrop(t *testing.T) {
+	env, cleanup := setup(t, WithKinVersion(4))
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+
+	setServiceConfigResp(t, env.v4Server, true)
+
+	err = env.client.CreateAccount(context.Background(), priv)
+	assert.NoError(t, err)
+
+	txID, err := env.client.RequestAirdrop(context.Background(), priv.Public(), 2)
+	assert.Equal(t, ErrAccountDoesNotExist, err)
+	assert.Nil(t, txID)
+
+	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+
+	txID, err = env.client.RequestAirdrop(context.Background(), kin.PublicKey(tokenAcc), 2)
+	require.NoError(t, err)
+	assert.NotNil(t, txID)
+}
