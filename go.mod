@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.1.2
 	github.com/hashicorp/golang-lru v0.5.1
 	github.com/kinecosystem/agora-api v0.25.0
-	github.com/kinecosystem/agora-common v0.67.0
+	github.com/kinecosystem/agora-common v0.68.0
 	github.com/kinecosystem/go v0.0.0-20191108204735-d6832148266e
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
 	github.com/mattn/go-colorable v0.1.6 // indirect
@@ -24,7 +24,6 @@ require (
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/genproto v0.0.0-20201204160425-06b3db808446 // indirect
 	google.golang.org/grpc v1.33.2
-	gopkg.in/yaml.v2 v2.2.8 // indirect
 )
 
 // This dependency of stellar/go no longer exists; use a forked version of the repo instead.

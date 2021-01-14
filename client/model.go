@@ -12,6 +12,7 @@ import (
 	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 
+	accountpbv4 "github.com/kinecosystem/agora-api/genproto/account/v4"
 	commonpb "github.com/kinecosystem/agora-api/genproto/common/v3"
 	transactionpbv4 "github.com/kinecosystem/agora-api/genproto/transaction/v4"
 )
@@ -364,3 +365,9 @@ const (
 	// instruction.
 	AccountResolutionPreferred
 )
+
+// EventsResult contains the result received from an account event stream. Either Events or Err will be set.
+type EventsResult struct {
+	Events []*accountpbv4.Event
+	Err    error
+}

@@ -25,7 +25,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	accountpb "github.com/kinecosystem/agora-api/genproto/account/v3"
 	accountpbv4 "github.com/kinecosystem/agora-api/genproto/account/v4"
@@ -582,6 +584,145 @@ func TestInternal_SolanaAccountRoundTrip(t *testing.T) {
 	assert.EqualValues(t, priv.Public(), setAuth.CurrentAuthority)
 	assert.Equal(t, subsidizer, setAuth.NewAuthority)
 	assert.Equal(t, token.AuthorityTypeCloseAccount, setAuth.Type)
+}
+
+func TestInternal_GetEvents(t *testing.T) {
+	env, cleanup := setup(t)
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+
+	// Test Error
+	env.v4Server.Mux.Lock()
+	env.v4Server.Errors = []error{errors.New("some error")}
+	env.v4Server.Mux.Unlock()
+
+	ch, err := env.internal.GetEvents(context.Background(), kin.PublicKey(tokenAcc))
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+
+	e, ok := <-ch
+	assert.True(t, ok)
+	assert.Nil(t, e.Events)
+	assert.Equal(t, codes.Internal, status.Code(e.Err))
+
+	e, ok = <-ch
+	assert.False(t, ok)
+
+	// Not Found
+	ch, err = env.internal.GetEvents(context.Background(), kin.PublicKey(tokenAcc))
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+
+	e, ok = <-ch
+	assert.True(t, ok)
+	assert.Nil(t, e.Events)
+	assert.Equal(t, ErrAccountDoesNotExist, e.Err)
+
+	e, ok = <-ch
+	assert.False(t, ok)
+
+	// Test receiving Events
+	setServiceConfigResp(t, env.v4Server, true)
+	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil))
+
+	events := []*accountpbv4.Events{
+		{
+			Result: accountpbv4.Events_OK,
+			Events: []*accountpbv4.Event{
+				{
+					Type: &accountpbv4.Event_AccountUpdateEvent{
+						AccountUpdateEvent: &accountpbv4.AccountUpdateEvent{
+							AccountInfo: &accountpbv4.AccountInfo{
+								AccountId: &commonpbv4.SolanaAccountId{Value: tokenAcc},
+								Balance:   10,
+							},
+						},
+					},
+				},
+				{
+					Type: &accountpbv4.Event_TransactionEvent{
+						TransactionEvent: &accountpbv4.TransactionEvent{
+							Transaction: &commonpbv4.Transaction{Value: []byte("txbytes")},
+						},
+					},
+				},
+				{
+					Type: &accountpbv4.Event_AccountUpdateEvent{
+						AccountUpdateEvent: &accountpbv4.AccountUpdateEvent{
+							AccountInfo: &accountpbv4.AccountInfo{
+								AccountId: &commonpbv4.SolanaAccountId{Value: tokenAcc},
+								Balance:   20,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Result: accountpbv4.Events_OK,
+			Events: []*accountpbv4.Event{
+				{
+					Type: &accountpbv4.Event_TransactionEvent{
+						TransactionEvent: &accountpbv4.TransactionEvent{
+							Transaction: &commonpbv4.Transaction{Value: []byte("txbytes")},
+						},
+					},
+				},
+				{
+					Type: &accountpbv4.Event_AccountUpdateEvent{
+						AccountUpdateEvent: &accountpbv4.AccountUpdateEvent{
+							AccountInfo: &accountpbv4.AccountInfo{
+								AccountId: &commonpbv4.SolanaAccountId{Value: tokenAcc},
+								Balance:   20,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Result: accountpbv4.Events_OK,
+			Events: []*accountpbv4.Event{
+				{
+					Type: &accountpbv4.Event_TransactionEvent{
+						TransactionEvent: &accountpbv4.TransactionEvent{
+							Transaction: &commonpbv4.Transaction{Value: []byte("txbytes")},
+						},
+					},
+				},
+				{
+					Type: &accountpbv4.Event_AccountUpdateEvent{
+						AccountUpdateEvent: &accountpbv4.AccountUpdateEvent{
+							AccountInfo: &accountpbv4.AccountInfo{
+								AccountId: &commonpbv4.SolanaAccountId{Value: tokenAcc},
+								Balance:   30,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	env.v4Server.Mux.Lock()
+	env.v4Server.EventsResponses = events
+	env.v4Server.Mux.Unlock()
+
+	ch, err = env.internal.GetEvents(context.Background(), kin.PublicKey(tokenAcc))
+	require.NoError(t, err)
+	require.NotNil(t, ch)
+
+	for _, resp := range events {
+		e, ok = <-ch
+		assert.True(t, ok)
+		require.Equal(t, len(resp.Events), len(e.Events))
+		for j, expected := range resp.Events {
+			assert.True(t, proto.Equal(expected, e.Events[j]))
+		}
+		assert.Nil(t, e.Err)
+	}
 }
 
 func TestInternal_CreateNoServiceSubsidizer(t *testing.T) {

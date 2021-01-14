@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	SDKVersion              = "0.5.0"
-	userAgentHeader         = "kin-user-agent"
+	SDKVersion      = "0.5.0"
+	userAgentHeader = "kin-user-agent"
 )
 
 var (
@@ -355,6 +355,47 @@ func (c *InternalClient) GetSolanaAccountInfo(ctx context.Context, account kin.P
 	}
 
 	return accountInfo, nil
+}
+
+func (c *InternalClient) GetEvents(ctx context.Context, account kin.PublicKey) (<-chan EventsResult, error) {
+	var ch chan EventsResult
+	_, err := c.retrier.Retry(func() error {
+		stream, err := c.accountClientV4.GetEvents(ctx, &accountpbv4.GetEventsRequest{AccountId: &commonpbv4.SolanaAccountId{Value: account}})
+		if err != nil {
+			return err
+		}
+
+		ch = make(chan EventsResult)
+		go func() {
+			defer close(ch)
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					ch <- EventsResult{
+						Err: err,
+					}
+					return
+				}
+
+				switch resp.GetResult() {
+				case accountpbv4.Events_NOT_FOUND:
+					ch <- EventsResult{
+						Err: ErrAccountDoesNotExist,
+					}
+					return
+				default:
+				}
+
+				ch <- EventsResult{
+					Events: resp.GetEvents(),
+				}
+			}
+		}()
+
+		return nil
+	})
+
+	return ch, err
 }
 
 func (c *InternalClient) ResolveTokenAccounts(ctx context.Context, publicKey kin.PublicKey) (accounts []kin.PublicKey, err error) {

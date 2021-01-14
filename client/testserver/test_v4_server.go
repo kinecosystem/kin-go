@@ -43,6 +43,8 @@ type V4Server struct {
 	Gets            map[string]transactionpbv4.GetTransactionResponse
 	Submits         []*transactionpbv4.SubmitTransactionRequest
 	SubmitResponses []*transactionpbv4.SubmitTransactionResponse
+
+	EventsResponses []*accountpbv4.Events
 }
 
 func NewV4Server() *V4Server {
@@ -148,8 +150,28 @@ func (t *V4Server) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.Re
 	}, nil
 }
 
-func (t *V4Server) GetEvents(*accountpbv4.GetEventsRequest, accountpbv4.Account_GetEventsServer) error {
-	return status.Error(codes.Unimplemented, "")
+func (t *V4Server) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4.Account_GetEventsServer) error {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := t.GetError(); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	if _, ok := t.Accounts[base58.Encode(req.AccountId.Value)]; !ok {
+		if err := stream.Send(&accountpbv4.Events{Result: accountpbv4.Events_NOT_FOUND}); err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+		return nil
+	}
+
+	for _, e := range t.EventsResponses {
+		if err := stream.Send(e); err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	return nil
 }
 
 func (t *V4Server) GetServiceConfig(ctx context.Context, req *transactionpbv4.GetServiceConfigRequest) (*transactionpbv4.GetServiceConfigResponse, error) {

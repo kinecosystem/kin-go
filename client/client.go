@@ -22,6 +22,7 @@ import (
 	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 
 	commonpb "github.com/kinecosystem/agora-api/genproto/common/v3"
@@ -313,6 +314,7 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 		retry.Limit(c.opts.maxRetries),
 		retry.BackoffWithJitter(backoff.BinaryExponential(c.opts.minDelay), c.opts.maxDelay, 0.1),
 		retry.NonRetriableErrors(nonRetriableErrors...),
+		retry.NonRetriableGRPCCodes(codes.Canceled),
 	)
 
 	c.internal = NewInternalClient(c.opts.cc, retrier, c.opts.kinVersion, c.opts.desiredKinVersion)
