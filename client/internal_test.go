@@ -168,6 +168,31 @@ func TestInternal_CreateStellarAccountKin2(t *testing.T) {
 	assert.NotNil(t, env.internal.CreateStellarAccount(context.Background(), priv))
 }
 
+func TestInternal_CreateStellarAccountBlockchainVersionError(t *testing.T) {
+	env, cleanup := setup(t, WithDesiredKinVersion(4))
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+
+	setServiceConfigResp(t, env.v4Server, true)
+
+	err = env.internal.CreateStellarAccount(context.Background(), priv)
+	assert.Equal(t, ErrBlockchainVersion, err)
+}
+
+func TestInternal_GetStellarAccountInfoBlockchainVersionError(t *testing.T) {
+	env, cleanup := setup(t, WithDesiredKinVersion(4))
+	defer cleanup()
+
+	priv, err := kin.NewPrivateKey()
+	require.NoError(t, err)
+
+	info, err := env.internal.GetStellarAccountInfo(context.Background(), priv.Public())
+	assert.Equal(t, ErrBlockchainVersion, err)
+	assert.Nil(t, info)
+}
+
 func TestInternal_GetStellarTransaction(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
@@ -478,6 +503,29 @@ func TestInternal_SubmitStellarTransactionKin2(t *testing.T) {
 			assert.EqualValues(t, txHash[:], submitResult.ID)
 		}
 	}
+}
+
+func TestInternal_SubmitStellarTransactionBlockchainVersionError(t *testing.T) {
+	env, cleanup := setup(t, WithDesiredKinVersion(4))
+	defer cleanup()
+
+	// Test happy path (hash is returned)
+	accounts := testutil.GenerateAccountIDs(t, 2)
+	envelope := testutil.GenerateTransactionEnvelope(
+		accounts[0],
+		1,
+		[]xdr.Operation{
+			testutil.GeneratePaymentOperation(&accounts[0], accounts[1]),
+		},
+	)
+
+	envelopeBytes, err := envelope.MarshalBinary()
+	require.NoError(t, err)
+
+	txData, err := env.internal.SubmitStellarTransaction(context.Background(), envelopeBytes, nil)
+	assert.Equal(t, ErrBlockchainVersion, err)
+	assert.Empty(t, txData.ID)
+	assert.Empty(t, txData.InvoiceErrors)
 }
 
 func TestInternal_SolanaAccountRoundTrip(t *testing.T) {

@@ -35,6 +35,8 @@ var (
 	ErrTransactionRejected = errors.New("transaction rejected")
 	ErrAlreadySubmitted    = errors.New("transaction already submitted")
 
+	ErrBlockchainVersion = errors.New("unsupported blockchain version")
+
 	errNoTokenAccounts  = errors.New("no token accounts")
 	errUnexpectedResult = errors.New("unexpected result from agora")
 
@@ -54,6 +56,7 @@ var (
 		ErrPayerRequired,
 		ErrTransactionRejected,
 		ErrAlreadySubmitted,
+		ErrBlockchainVersion,
 	}
 )
 

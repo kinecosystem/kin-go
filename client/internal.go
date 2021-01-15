@@ -18,7 +18,9 @@ import (
 	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	accountpb "github.com/kinecosystem/agora-api/genproto/account/v3"
 	accountpbv4 "github.com/kinecosystem/agora-api/genproto/account/v4"
@@ -106,6 +108,9 @@ func (c *InternalClient) CreateStellarAccount(ctx context.Context, key kin.Priva
 				},
 			})
 			if err != nil {
+				if status.Code(err) == codes.FailedPrecondition {
+					return ErrBlockchainVersion
+				}
 				return err
 			}
 
@@ -135,6 +140,9 @@ func (c *InternalClient) GetStellarAccountInfo(ctx context.Context, account kin.
 				},
 			})
 			if err != nil {
+				if status.Code(err) == codes.FailedPrecondition {
+					return ErrBlockchainVersion
+				}
 				return err
 			}
 
@@ -215,6 +223,9 @@ func (c *InternalClient) SubmitStellarTransaction(ctx context.Context, envelopeX
 		return err
 	})
 	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return result, ErrBlockchainVersion
+		}
 		return result, errors.Wrap(err, "failed to submit transaction")
 	}
 

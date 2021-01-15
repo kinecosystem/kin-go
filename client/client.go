@@ -22,9 +22,7 @@ import (
 	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/status"
 
 	commonpb "github.com/kinecosystem/agora-api/genproto/common/v3"
 	commonpbv4 "github.com/kinecosystem/agora-api/genproto/common/v4"
@@ -334,7 +332,7 @@ func (c *client) CreateAccount(ctx context.Context, key kin.PrivateKey, opts ...
 	case version.KinVersion2, version.KinVersion3:
 		err := c.internal.CreateStellarAccount(ctx, key)
 		if err != nil {
-			if status.Code(err) == codes.FailedPrecondition {
+			if err == ErrBlockchainVersion {
 				c.opts.kinVersion = 4
 				c.internal.kinVersion = 4
 				break
@@ -369,7 +367,7 @@ func (c *client) GetBalance(ctx context.Context, account kin.PublicKey, opts ...
 	case version.KinVersion2, version.KinVersion3:
 		accountInfo, err := c.internal.GetStellarAccountInfo(ctx, account)
 		if err != nil {
-			if status.Code(err) == codes.FailedPrecondition {
+			if err == ErrBlockchainVersion {
 				c.opts.kinVersion = 4
 				c.internal.kinVersion = 4
 				break
@@ -553,7 +551,7 @@ func (c *client) SubmitPayment(ctx context.Context, payment Payment, opts ...Sol
 		}
 
 		result, err = c.signAndSubmitXDR(ctx, signers, envelope, invoiceList)
-		if err != nil && status.Code(err) == codes.FailedPrecondition {
+		if err == ErrBlockchainVersion {
 			c.opts.kinVersion = 4
 			c.internal.kinVersion = 4
 			result, err = c.submitPaymentWithResolution(ctx, payment, solanaOpts)
