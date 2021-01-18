@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## [v0.6.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.6.0)
+- Don't retry on precondition failed
+- Add `GetEvents` to internal client
+
 ## [v0.5.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.5.0)
 - Expose `RequestAirdrop` on `Client` for Kin 4
 
