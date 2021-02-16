@@ -19,7 +19,6 @@ import (
 	"github.com/kinecosystem/agora-common/webhook/events"
 	"github.com/kinecosystem/agora-common/webhook/signtransaction"
 	"github.com/pkg/errors"
-	"github.com/stellar/go/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -206,99 +205,6 @@ func TestSignTransactionHandler(t *testing.T) {
 
 	called := false
 	f := func(req SignTransactionRequest, resp *SignTransactionResponse) error {
-		assert.Nil(t, req.SolanaTransaction)
-		assert.Len(t, req.Envelope.Tx.Operations, 10)
-		assert.Len(t, req.Payments, 10)
-
-		var memoCount, invoiceCount int
-		for _, p := range req.Payments {
-			assert.NotEmpty(t, p.Sender)
-			assert.NotEmpty(t, p.Destination)
-			assert.NotZero(t, p.Quarks)
-			assert.Equal(t, kin.TransactionTypeSpend, p.Type)
-
-			if p.Memo != "" {
-				memoCount++
-			}
-			if p.Invoice != nil {
-				invoiceCount++
-			}
-		}
-
-		if memoCount > 0 {
-			assert.Equal(t, 10, memoCount)
-			assert.Zero(t, invoiceCount)
-		} else if invoiceCount > 0 {
-			assert.Zero(t, memoCount)
-			assert.Equal(t, 10, invoiceCount)
-		} else {
-			assert.Zero(t, memoCount)
-			assert.Zero(t, invoiceCount)
-		}
-
-		called = true
-		return resp.Sign(whitelist)
-	}
-
-	signRequests := []signtransaction.Request{
-		genRequest(t, xdr.MemoTypeMemoNone, 3),
-		genRequest(t, xdr.MemoTypeMemoText, 3),
-		genRequest(t, xdr.MemoTypeMemoHash, 3),
-	}
-	for _, data := range signRequests {
-		body, err := json.Marshal(data)
-		require.NoError(t, err)
-
-		secret := "secret"
-		b := bytes.NewBuffer(body)
-		h := hmac.New(sha256.New, []byte(secret))
-		_, _ = h.Write(b.Bytes())
-		sig := h.Sum(nil)
-
-		req, err := http.NewRequest(http.MethodPost, "/sign_transaction", b)
-		require.NoError(t, err)
-		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
-
-		rr := httptest.NewRecorder()
-		handler := SignTransactionHandler(EnvironmentTest, secret, f)
-		handler.ServeHTTP(rr, req)
-
-		assert.Equal(t, http.StatusOK, rr.Code)
-		assert.True(t, called)
-		called = false
-
-		var resp signtransaction.SuccessResponse
-		assert.NoError(t, json.NewDecoder(rr.Result().Body).Decode(&resp))
-
-		var envelope xdr.TransactionEnvelope
-		assert.NoError(t, envelope.UnmarshalBinary(resp.EnvelopeXDR))
-		assert.Len(t, envelope.Signatures, 1)
-	}
-
-	// if no webhook secret was provided, don't validate
-	signRequest := genRequest(t, xdr.MemoTypeMemoNone, 3)
-	body, err := json.Marshal(signRequest)
-	require.NoError(t, err)
-
-	req, err := http.NewRequest(http.MethodPost, "/sign_transaction", bytes.NewBuffer(body))
-	require.NoError(t, err)
-	req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString([]byte("fake sig")))
-
-	rr := httptest.NewRecorder()
-	handler := SignTransactionHandler(EnvironmentTest, "", f)
-	handler.ServeHTTP(rr, req)
-
-	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.True(t, called)
-}
-
-func TestSignTransactionHandler_Kin4(t *testing.T) {
-	whitelist, err := kin.NewPrivateKey()
-	require.NoError(t, err)
-
-	called := false
-	f := func(req SignTransactionRequest, resp *SignTransactionResponse) error {
-		assert.Nil(t, req.Envelope)
 		assert.NotNil(t, req.SolanaTransaction)
 		assert.Len(t, req.Payments, 10)
 
@@ -338,9 +244,9 @@ func TestSignTransactionHandler_Kin4(t *testing.T) {
 	}
 
 	signRequests := []signtransaction.Request{
-		genKin4Request(t, false, false),
-		genKin4Request(t, false, true),
-		genKin4Request(t, true, false),
+		genRequest(t, false, false, 4),
+		genRequest(t, false, true, 4),
+		genRequest(t, true, false, 4),
 	}
 	for _, data := range signRequests {
 		body, err := json.Marshal(data)
@@ -370,7 +276,7 @@ func TestSignTransactionHandler_Kin4(t *testing.T) {
 	}
 
 	// if no webhook secret was provided, don't validate
-	signRequest := genKin4Request(t, false, false)
+	signRequest := genRequest(t, false, false, 4)
 	body, err := json.Marshal(signRequest)
 	require.NoError(t, err)
 
@@ -395,10 +301,7 @@ func TestSignTransactionHandler_Rejected(t *testing.T) {
 	}
 
 	signRequests := []signtransaction.Request{
-		genRequest(t, xdr.MemoTypeMemoNone, 3),
-		genRequest(t, xdr.MemoTypeMemoText, 3),
-		genRequest(t, xdr.MemoTypeMemoHash, 3),
-		genKin4Request(t, false, false),
+		genRequest(t, false, false, 4),
 	}
 	for _, data := range signRequests {
 		body, err := json.Marshal(data)
@@ -442,10 +345,7 @@ func TestSignTransactionHandler_InvoiceErrors(t *testing.T) {
 	}
 
 	signRequests := []signtransaction.Request{
-		genRequest(t, xdr.MemoTypeMemoNone, 3),
-		genRequest(t, xdr.MemoTypeMemoText, 3),
-		genRequest(t, xdr.MemoTypeMemoHash, 3),
-		genKin4Request(t, false, false),
+		genRequest(t, false, false, 4),
 	}
 	for _, data := range signRequests {
 		body, err := json.Marshal(data)
@@ -482,6 +382,7 @@ func TestSignTransactionHandler_InvoiceErrors(t *testing.T) {
 		assert.EqualValues(t, resp.InvoiceErrors[2].Reason, signtransaction.SKUNotFound)
 	}
 }
+
 func TestSignTransactionHandler_Invalid(t *testing.T) {
 	f := func(req SignTransactionRequest, resp *SignTransactionResponse) error {
 		t.Fail()
@@ -564,7 +465,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	}
 
 	// Invalid version
-	signReq := genRequest(t, xdr.MemoTypeMemoNone, 1)
+	signReq := genRequest(t, false, false, 1)
 	rr = httptest.NewRecorder()
 	handler = SignTransactionHandler(EnvironmentTest, "", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
@@ -572,7 +473,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
 	// Generate a request with mis-matched invoice counts
-	signReq = genRequest(t, xdr.MemoTypeMemoHash, 3)
+	signReq = genRequest(t, true, false, 4)
 	invoiceList := &commonpb.InvoiceList{}
 	assert.NoError(t, proto.Unmarshal(signReq.InvoiceList, invoiceList))
 	invoiceList.Invoices = invoiceList.Invoices[1:]
@@ -587,8 +488,8 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
 	// Generate a request with malformed XDR
-	signReq = genRequest(t, xdr.MemoTypeMemoHash, 3)
-	signReq.EnvelopeXDR = signReq.EnvelopeXDR[1:]
+	signReq = genRequest(t, false, false, 4)
+	signReq.SolanaTransaction = []byte("somebytes")
 
 	rr = httptest.NewRecorder()
 	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
@@ -596,33 +497,15 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
 	// Generate a request with a malformed invoice list
-	signReq = genRequest(t, xdr.MemoTypeMemoHash, 3)
+	signReq = genRequest(t, true, false, 4)
 	signReq.InvoiceList = signReq.InvoiceList[1:]
 	rr = httptest.NewRecorder()
 	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
-	// Generate kin 2 with no envelope
-	signReq = genRequest(t, xdr.MemoTypeMemoHash, 2)
-	signReq.EnvelopeXDR = nil
-
-	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
-	handler.ServeHTTP(rr, makeReq(signReq))
-	assert.Equal(t, http.StatusBadRequest, rr.Code)
-
-	// Generate kin 3 with no envelope
-	signReq = genRequest(t, xdr.MemoTypeMemoHash, 3)
-	signReq.EnvelopeXDR = nil
-
-	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
-	handler.ServeHTTP(rr, makeReq(signReq))
-	assert.Equal(t, http.StatusBadRequest, rr.Code)
-
 	// Generate kin 4 with no solana transaction
-	signReq = genKin4Request(t, false, false)
+	signReq = genRequest(t, false, false, 4)
 	signReq.SolanaTransaction = nil
 
 	rr = httptest.NewRecorder()
@@ -631,60 +514,12 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
-func genRequest(t *testing.T, memoType xdr.MemoType, version int) signtransaction.Request {
-	accounts := testutil.GenerateAccountIDs(t, 10)
-	invoiceList := &commonpb.InvoiceList{}
-
-	var ops []xdr.Operation
-	for i := 0; i < 10; i++ {
-		ops = append(ops, testutil.GeneratePaymentOperation(&accounts[0], accounts[i]))
-		invoiceList.Invoices = append(invoiceList.Invoices, &commonpb.Invoice{
-			Items: []*commonpb.Invoice_LineItem{
-				{
-					Title:  "test",
-					Amount: int64(i),
-				},
-			},
-		})
-	}
-
-	envelope := testutil.GenerateTransactionEnvelope(accounts[0], 1, ops)
-	req := signtransaction.Request{
-		KinVersion: version,
-	}
-
-	switch memoType {
-	case xdr.MemoTypeMemoText:
-		m := "1-test"
-		envelope.Tx.Memo = xdr.Memo{
-			Type: memoType,
-			Text: &m,
-		}
-	case xdr.MemoTypeMemoHash:
-		ilBytes, err := proto.Marshal(invoiceList)
-		require.NoError(t, err)
-		req.InvoiceList = ilBytes
-
-		var placeholder xdr.Hash
-		envelope.Tx.Memo = xdr.Memo{
-			Type: memoType,
-			Hash: &placeholder,
-		}
-	}
-
-	var err error
-	req.EnvelopeXDR, err = envelope.MarshalBinary()
-	require.NoError(t, err)
-	return req
-}
-
-func genKin4Request(t *testing.T, useInvoice, useMemo bool) signtransaction.Request {
+func genRequest(t *testing.T, useInvoice, useMemo bool, version int) signtransaction.Request {
 	accounts := make([]ed25519.PrivateKey, 10)
 	for i := 0; i < 10; i++ {
 		accounts[i] = testutil.GenerateSolanaKeypair(t)
 	}
 
-	invoiceList := &commonpb.InvoiceList{}
 	var transfers []solana.Instruction
 	for i := 0; i < 10; i++ {
 		transfers = append(transfers, token.Transfer(
@@ -692,14 +527,6 @@ func genKin4Request(t *testing.T, useInvoice, useMemo bool) signtransaction.Requ
 			accounts[i].Public().(ed25519.PublicKey),
 			accounts[0].Public().(ed25519.PublicKey),
 			1))
-		invoiceList.Invoices = append(invoiceList.Invoices, &commonpb.Invoice{
-			Items: []*commonpb.Invoice_LineItem{
-				{
-					Title:  "test",
-					Amount: int64(i),
-				},
-			},
-		})
 	}
 
 	req := signtransaction.Request{
@@ -711,6 +538,18 @@ func genKin4Request(t *testing.T, useInvoice, useMemo bool) signtransaction.Requ
 		m := "1-test"
 		instructions = append(instructions, memo.Instruction(m))
 	} else if useInvoice {
+		invoiceList := &commonpb.InvoiceList{}
+		for i := 0; i < 10; i++ {
+			invoiceList.Invoices = append(invoiceList.Invoices, &commonpb.Invoice{
+				Items: []*commonpb.Invoice_LineItem{
+					{
+						Title:  "test",
+						Amount: int64(i),
+					},
+				},
+			})
+		}
+
 		ilBytes, err := proto.Marshal(invoiceList)
 		require.NoError(t, err)
 		req.InvoiceList = ilBytes
@@ -728,6 +567,7 @@ func genKin4Request(t *testing.T, useInvoice, useMemo bool) signtransaction.Requ
 
 	var err error
 	req.SolanaTransaction = solana.NewTransaction(accounts[0].Public().(ed25519.PublicKey), instructions...).Marshal()
+	req.KinVersion = version
 	require.NoError(t, err)
 	return req
 }

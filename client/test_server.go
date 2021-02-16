@@ -1,266 +1,340 @@
 package client
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/ed25519"
+	"strings"
 	"sync"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/kinecosystem/agora-common/kin/version"
-	"github.com/kinecosystem/go/xdr"
+	"github.com/kinecosystem/agora-api/genproto/airdrop/v4"
+	"github.com/kinecosystem/agora-common/solana"
+	"github.com/kinecosystem/agora-common/solana/system"
+	"github.com/kinecosystem/agora-common/solana/token"
+	"github.com/mr-tron/base58"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	accountpb "github.com/kinecosystem/agora-api/genproto/account/v3"
-	commonpb "github.com/kinecosystem/agora-api/genproto/common/v3"
-	transactionpb "github.com/kinecosystem/agora-api/genproto/transaction/v3"
+	accountpbv4 "github.com/kinecosystem/agora-api/genproto/account/v4"
+	airdroppbv4 "github.com/kinecosystem/agora-api/genproto/airdrop/v4"
+	commonpbv4 "github.com/kinecosystem/agora-api/genproto/common/v4"
+	transactionpbv4 "github.com/kinecosystem/agora-api/genproto/transaction/v4"
 )
 
-type testBlockchain struct {
-	accounts map[string]*accountpb.AccountInfo
-	gets     map[string]transactionpb.GetTransactionResponse
+var RecentBlockhash = bytes.Repeat([]byte{1}, 32)
+var MinBalanceForRentException = uint64(1234567)
+var MaxAirdrop = uint64(100000)
 
-	submits         []*transactionpb.SubmitTransactionRequest
-	submitResponses []*transactionpb.SubmitTransactionResponse
+type server struct {
+	Mux    sync.Mutex
+	Errors []error
+
+	Creates       []*accountpbv4.CreateAccountRequest
+	Accounts      map[string]*accountpbv4.AccountInfo
+	TokenAccounts map[string][]*commonpbv4.SolanaAccountId
+
+	ServiceConfigReqs []*transactionpbv4.GetServiceConfigRequest
+	ServiceConfig     *transactionpbv4.GetServiceConfigResponse
+	Subsidizer        ed25519.PrivateKey
+
+	Gets            map[string]transactionpbv4.GetTransactionResponse
+	Submits         []*transactionpbv4.SubmitTransactionRequest
+	SubmitResponses []*transactionpbv4.SubmitTransactionResponse
+
+	EventsResponses []*accountpbv4.Events
 }
 
-type testServer struct {
-	mu     sync.Mutex
-	errors []error
-
-	blockchains map[version.KinVersion]*testBlockchain
-}
-
-func newTestServer() *testServer {
-	blockchains := make(map[version.KinVersion]*testBlockchain)
-	for _, v := range []version.KinVersion{version.KinVersion2, version.KinVersion3} {
-		blockchains[v] = &testBlockchain{
-			accounts: make(map[string]*accountpb.AccountInfo),
-			gets:     make(map[string]transactionpb.GetTransactionResponse),
-		}
+func newServer() *server {
+	return &server{
+		Accounts:      make(map[string]*accountpbv4.AccountInfo),
+		TokenAccounts: make(map[string][]*commonpbv4.SolanaAccountId),
+		Gets:          make(map[string]transactionpbv4.GetTransactionResponse),
 	}
-
-	return &testServer{
-		blockchains: blockchains,
-	}
 }
 
-func (t *testServer) CreateAccount(ctx context.Context, req *accountpb.CreateAccountRequest) (*accountpb.CreateAccountResponse, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *server) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccountRequest) (*accountpbv4.CreateAccountResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
 
-	if err := validateHeaders(ctx); err != nil {
+	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
 
-	if err := t.getError(); err != nil {
+	if err := t.GetError(); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	kinVersion, err := version.GetCtxKinVersion(ctx)
+	var tx solana.Transaction
+	if err := tx.Unmarshal(req.Transaction.Value); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "bad transaction encoding")
+	}
+
+	t.Creates = append(t.Creates, proto.Clone(req).(*accountpbv4.CreateAccountRequest))
+
+	sysCreate, err := system.DecompileCreateAccount(tx.Message, 0)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, status.Error(codes.InvalidArgument, "invalid Sys::CreateAccount instruction")
 	}
 
-	desired, err := version.GetCtxDesiredVersion(ctx)
-	if err == nil {
-		if desired == version.KinVersion4 {
-			return nil, status.Error(codes.FailedPrecondition, "unsupported version")
-		}
+	tokenInit, err := token.DecompileInitializeAccount(tx.Message, 1)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid Token::InitializeAccount instruction")
 	}
 
-	blockchain := t.blockchains[kinVersion]
-	if _, ok := blockchain.accounts[req.AccountId.Value]; ok {
-		return &accountpb.CreateAccountResponse{
-			Result: accountpb.CreateAccountResponse_EXISTS,
+	tokenAccID := base58.Encode(sysCreate.Address)
+	ownerID := base58.Encode(tokenInit.Owner)
+
+	if info, ok := t.Accounts[tokenAccID]; ok {
+		return &accountpbv4.CreateAccountResponse{
+			Result:      accountpbv4.CreateAccountResponse_EXISTS,
+			AccountInfo: proto.Clone(info).(*accountpbv4.AccountInfo),
 		}, nil
 	}
 
-	blockchain.accounts[req.AccountId.Value] = &accountpb.AccountInfo{
-		AccountId:      proto.Clone(req.AccountId).(*commonpb.StellarAccountId),
-		SequenceNumber: 1,
-		Balance:        10,
+	accountInfo := &accountpbv4.AccountInfo{
+		AccountId: &commonpbv4.SolanaAccountId{Value: sysCreate.Address},
+		Balance:   10,
 	}
+	t.Accounts[tokenAccID] = accountInfo
+	t.TokenAccounts[ownerID] = append(t.TokenAccounts[ownerID], &commonpbv4.SolanaAccountId{Value: sysCreate.Address})
 
-	return &accountpb.CreateAccountResponse{}, nil
-}
-func (t *testServer) GetAccountInfo(ctx context.Context, req *accountpb.GetAccountInfoRequest) (*accountpb.GetAccountInfoResponse, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if err := validateHeaders(ctx); err != nil {
-		return nil, err
-	}
-
-	kinVersion, err := version.GetCtxKinVersion(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	desired, err := version.GetCtxDesiredVersion(ctx)
-	if err == nil {
-		if desired == version.KinVersion4 {
-			return nil, status.Error(codes.FailedPrecondition, "unsupported version")
-		}
-	}
-
-	blockchain := t.blockchains[kinVersion]
-	accountInfo, ok := blockchain.accounts[req.AccountId.Value]
-	if !ok {
-		return &accountpb.GetAccountInfoResponse{
-			Result: accountpb.GetAccountInfoResponse_NOT_FOUND,
-		}, nil
-	}
-
-	return &accountpb.GetAccountInfoResponse{
-		AccountInfo: proto.Clone(accountInfo).(*accountpb.AccountInfo),
+	return &accountpbv4.CreateAccountResponse{
+		AccountInfo: accountInfo,
 	}, nil
 }
-func (t *testServer) GetEvents(*accountpb.GetEventsRequest, accountpb.Account_GetEventsServer) error {
-	return status.Error(codes.Unimplemented, "")
-}
 
-func (t *testServer) SubmitTransaction(ctx context.Context, req *transactionpb.SubmitTransactionRequest) (*transactionpb.SubmitTransactionResponse, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *server) GetAccountInfo(ctx context.Context, req *accountpbv4.GetAccountInfoRequest) (*accountpbv4.GetAccountInfoResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
 
-	if err := validateHeaders(ctx); err != nil {
+	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
 
-	if err := t.getError(); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	accountInfo, ok := t.Accounts[base58.Encode(req.AccountId.Value)]
+	if !ok {
+		return &accountpbv4.GetAccountInfoResponse{
+			Result: accountpbv4.GetAccountInfoResponse_NOT_FOUND,
+		}, nil
 	}
 
-	kinVersion, err := version.GetCtxKinVersion(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	return &accountpbv4.GetAccountInfoResponse{
+		AccountInfo: proto.Clone(accountInfo).(*accountpbv4.AccountInfo),
+	}, nil
+}
+
+func (t *server) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.ResolveTokenAccountsRequest) (*accountpbv4.ResolveTokenAccountsResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
 	}
 
-	desired, err := version.GetCtxDesiredVersion(ctx)
-	if err == nil {
-		if desired == version.KinVersion4 {
-			return nil, status.Error(codes.FailedPrecondition, "unsupported version")
+	ownerID := base58.Encode(req.AccountId.Value)
+
+	accounts, ok := t.TokenAccounts[ownerID]
+	if !ok {
+		return &accountpbv4.ResolveTokenAccountsResponse{}, nil
+	}
+
+	tokenAccounts := make([]*commonpbv4.SolanaAccountId, len(accounts))
+	for i, a := range accounts {
+		tokenAccounts[i] = proto.Clone(a).(*commonpbv4.SolanaAccountId)
+	}
+	return &accountpbv4.ResolveTokenAccountsResponse{
+		TokenAccounts: tokenAccounts,
+	}, nil
+}
+
+func (t *server) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4.Account_GetEventsServer) error {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := t.GetError(); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+
+	if _, ok := t.Accounts[base58.Encode(req.AccountId.Value)]; !ok {
+		if err := stream.Send(&accountpbv4.Events{Result: accountpbv4.Events_NOT_FOUND}); err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+		return nil
+	}
+
+	for _, e := range t.EventsResponses {
+		if err := stream.Send(e); err != nil {
+			return status.Error(codes.Internal, err.Error())
 		}
 	}
 
-	blockchain := t.blockchains[kinVersion]
-	var envelope xdr.TransactionEnvelope
-	if err := envelope.UnmarshalBinary(req.EnvelopeXdr); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unmarshal envelope: %v", err)
-	}
-	txBytes, err := envelope.Tx.MarshalBinary()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to marshal tx: %v", err)
-	}
-	txHash := sha256.Sum256(txBytes)
+	return nil
+}
 
-	blockchain.submits = append(blockchain.submits, proto.Clone(req).(*transactionpb.SubmitTransactionRequest))
-	if len(blockchain.submitResponses) > 0 {
-		r := blockchain.submitResponses[0]
-		blockchain.submitResponses = blockchain.submitResponses[1:]
+func (t *server) GetServiceConfig(ctx context.Context, req *transactionpbv4.GetServiceConfigRequest) (*transactionpbv4.GetServiceConfigResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	t.ServiceConfigReqs = append(t.ServiceConfigReqs, req)
+	return t.ServiceConfig, nil
+}
+
+func (t *server) GetMinimumKinVersion(ctx context.Context, req *transactionpbv4.GetMinimumKinVersionRequest) (*transactionpbv4.GetMinimumKinVersionResponse, error) {
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	return &transactionpbv4.GetMinimumKinVersionResponse{Version: 4}, nil
+}
+
+func (t *server) GetRecentBlockhash(ctx context.Context, req *transactionpbv4.GetRecentBlockhashRequest) (*transactionpbv4.GetRecentBlockhashResponse, error) {
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	return &transactionpbv4.GetRecentBlockhashResponse{Blockhash: &commonpbv4.Blockhash{Value: RecentBlockhash}}, nil
+}
+
+func (t *server) GetMinimumBalanceForRentExemption(ctx context.Context, req *transactionpbv4.GetMinimumBalanceForRentExemptionRequest) (*transactionpbv4.GetMinimumBalanceForRentExemptionResponse, error) {
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	return &transactionpbv4.GetMinimumBalanceForRentExemptionResponse{Lamports: MinBalanceForRentException}, nil
+}
+
+func (t *server) GetHistory(context.Context, *transactionpbv4.GetHistoryRequest) (*transactionpbv4.GetHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func (t *server) SubmitTransaction(ctx context.Context, req *transactionpbv4.SubmitTransactionRequest) (*transactionpbv4.SubmitTransactionResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := t.GetError(); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	tx := solana.Transaction{}
+	if err := tx.Unmarshal(req.Transaction.Value); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to unmarshal tx: %v", err)
+	}
+
+	t.Submits = append(t.Submits, proto.Clone(req).(*transactionpbv4.SubmitTransactionRequest))
+	if len(t.SubmitResponses) > 0 {
+		r := t.SubmitResponses[0]
+		t.SubmitResponses = t.SubmitResponses[1:]
 		if r != nil {
-			r.Hash = &commonpb.TransactionHash{
-				Value: txHash[:],
+			r.Signature = &commonpbv4.TransactionSignature{
+				Value: tx.Signature(),
 			}
 			return r, nil
 		}
 	}
 
-	// Update the sequence number
-	info := blockchain.accounts[envelope.Tx.SourceAccount.Address()]
-	if info == nil {
-		info = &accountpb.AccountInfo{
-			AccountId: &commonpb.StellarAccountId{
-				Value: envelope.Tx.SourceAccount.Address(),
-			},
+	if t.ServiceConfig != nil && t.ServiceConfig.GetSubsidizerAccount() != nil && t.Subsidizer != nil && bytes.Equal(tx.Signatures[0][:], make([]byte, ed25519.SignatureSize)) {
+		err := tx.Sign(t.Subsidizer)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to sign transaction with subsidizer")
 		}
 	}
-	info.SequenceNumber++
-	blockchain.accounts[envelope.Tx.SourceAccount.Address()] = info
 
-	resultXDR := xdr.TransactionResult{
-		Result: xdr.TransactionResultResult{
-			Code:    xdr.TransactionResultCodeTxSuccess,
-			Results: &[]xdr.OperationResult{},
+	return &transactionpbv4.SubmitTransactionResponse{
+		Signature: &commonpbv4.TransactionSignature{
+			Value: tx.Signature(),
 		},
-	}
-	resultBytes, err := resultXDR.MarshalBinary()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to marshal result: %v", err)
-	}
-
-	return &transactionpb.SubmitTransactionResponse{
-		Hash: &commonpb.TransactionHash{
-			Value: txHash[:],
-		},
-		Ledger:    1,
-		ResultXdr: resultBytes,
 	}, nil
 }
 
-func (t *testServer) GetTransaction(ctx context.Context, req *transactionpb.GetTransactionRequest) (*transactionpb.GetTransactionResponse, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *server) GetTransaction(ctx context.Context, req *transactionpbv4.GetTransactionRequest) (*transactionpbv4.GetTransactionResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
 
-	if err := validateHeaders(ctx); err != nil {
+	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
 
-	if err := t.getError(); err != nil {
+	if err := t.GetError(); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	kinVersion, err := version.GetCtxKinVersion(ctx)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	blockchain := t.blockchains[kinVersion]
-	if resp, ok := blockchain.gets[string(req.TransactionHash.Value)]; ok {
+	if resp, ok := t.Gets[string(req.TransactionId.Value)]; ok {
 		return &resp, nil
 	}
 
-	return &transactionpb.GetTransactionResponse{
-		State: transactionpb.GetTransactionResponse_UNKNOWN,
+	return &transactionpbv4.GetTransactionResponse{
+		State: transactionpbv4.GetTransactionResponse_UNKNOWN,
 	}, nil
 }
 
-func (t *testServer) GetHistory(context.Context, *transactionpb.GetHistoryRequest) (*transactionpb.GetHistoryResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+func (t *server) RequestAirdrop(ctx context.Context, req *airdrop.RequestAirdropRequest) (*airdrop.RequestAirdropResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := t.GetError(); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	_, ok := t.Accounts[base58.Encode(req.AccountId.Value)]
+	if !ok {
+		return &airdroppbv4.RequestAirdropResponse{Result: airdroppbv4.RequestAirdropResponse_NOT_FOUND}, nil
+	}
+
+	if req.Quarks > MaxAirdrop {
+		return &airdroppbv4.RequestAirdropResponse{Result: airdroppbv4.RequestAirdropResponse_INSUFFICIENT_KIN}, nil
+	}
+
+	return &airdroppbv4.RequestAirdropResponse{
+		Signature: &commonpbv4.TransactionSignature{
+			Value: make([]byte, 64),
+		},
+	}, nil
 }
 
-func (t *testServer) setError(err error, n int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *server) SetError(err error, n int) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
 
-	t.errors = make([]error, n)
+	t.Errors = make([]error, n)
 	for i := 0; i < n; i++ {
-		t.errors[i] = err
+		t.Errors[i] = err
 	}
 }
 
-func (t *testServer) getError() error {
-	if len(t.errors) == 0 {
+func (t *server) GetError() error {
+	if len(t.Errors) == 0 {
 		return nil
 	}
 
-	err := t.errors[0]
-	t.errors = t.errors[1:]
+	err := t.Errors[0]
+	t.Errors = t.Errors[1:]
 
 	return err
 }
 
-func validateHeaders(ctx context.Context) error {
+func validateV4Headers(ctx context.Context) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return status.Error(codes.Internal, "failed to parse metadata")
 	}
 
-	vals := md.Get(userAgentHeader)
+	vals := md.Get("kin-user-agent")
 	for _, v := range vals {
-		if v == userAgent {
+		if strings.Contains(v, "KinSDK") {
 			return nil
 		}
 	}

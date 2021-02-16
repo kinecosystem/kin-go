@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -11,15 +10,11 @@ import (
 	"github.com/golang/protobuf/proto"
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/kinecosystem/agora-common/kin"
-	"github.com/kinecosystem/agora-common/kin/version"
 	"github.com/kinecosystem/agora-common/retry"
 	"github.com/kinecosystem/agora-common/retry/backoff"
 	"github.com/kinecosystem/agora-common/solana"
 	"github.com/kinecosystem/agora-common/solana/memo"
 	"github.com/kinecosystem/agora-common/solana/token"
-	"github.com/kinecosystem/agora-common/stellar"
-	"github.com/kinecosystem/go/build"
-	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -36,16 +31,6 @@ type Environment string
 const (
 	EnvironmentTest Environment = "test"
 	EnvironmentProd Environment = "prod"
-)
-
-var (
-	testnet = build.Network{Passphrase: "Kin Testnet ; December 2018"}
-	mainnet = build.Network{Passphrase: "Kin Mainnet ; December 2018"}
-
-	kin2Testnet  = build.Network{Passphrase: "Kin Playground Network ; June 2018"}
-	kin2TMainnet = build.Network{Passphrase: "Public Global Kin Ecosystem Network ; June 2018"}
-
-	kinAssetCode = [4]byte{75, 73, 78, 0} // KIN
 )
 
 type Client interface {
@@ -82,7 +67,6 @@ type client struct {
 	opts     clientOpts
 
 	env          Environment
-	network      build.Network
 	accountCache *lru.Cache
 }
 
@@ -92,29 +76,15 @@ type clientOpts struct {
 	minDelay           time.Duration
 	maxDelay           time.Duration
 
-	cc           *grpc.ClientConn
-	endpoint     string
-	whitelistKey kin.PrivateKey
-	appIndex     uint16
-
-	kinVersion version.KinVersion
-	kinIssuer  kin.PublicKey
+	cc       *grpc.ClientConn
+	endpoint string
+	appIndex uint16
 
 	defaultCommitment commonpbv4.Commitment
-	desiredKinVersion version.KinVersion
 }
 
 // ClientOption configures a Client.
 type ClientOption func(*clientOpts)
-
-// WithKinVersion specifies the version of Kin to use.
-//
-// If none is provided, the client will default to using the Kin 3 blockchain.
-func WithKinVersion(kinVersion version.KinVersion) ClientOption {
-	return func(o *clientOpts) {
-		o.kinVersion = kinVersion
-	}
-}
 
 // WithAppIndex specifies the app index to use when
 // submitting transactions with Invoices, _or_ to use
@@ -140,14 +110,6 @@ func WithGRPC(cc *grpc.ClientConn) ClientOption {
 func WithEndpoint(endpoint string) ClientOption {
 	return func(o *clientOpts) {
 		o.endpoint = endpoint
-	}
-}
-
-// WithWhitelister specifies a whitelist key that will be used
-// to co-sign all transactions.
-func WithWhitelister(whitelistKey kin.PrivateKey) ClientOption {
-	return func(o *clientOpts) {
-		o.whitelistKey = whitelistKey
 	}
 }
 
@@ -181,13 +143,6 @@ func WithMinDelay(minDelay time.Duration) ClientOption {
 func WithMaxDelay(maxDelay time.Duration) ClientOption {
 	return func(o *clientOpts) {
 		o.maxDelay = maxDelay
-	}
-}
-
-// WithDesiredKinVersion specifies a minimum version to force Agora to use for testing purposes.
-func WithDesiredKinVersion(desiredVersion version.KinVersion) ClientOption {
-	return func(o *clientOpts) {
-		o.desiredKinVersion = desiredVersion
 	}
 }
 
@@ -248,7 +203,6 @@ type tokenAccountEntry struct {
 func New(env Environment, opts ...ClientOption) (Client, error) {
 	c := &client{
 		opts: clientOpts{
-			kinVersion:         version.KinVersion3,
 			maxRetries:         10,
 			maxSequenceRetries: 3,
 			minDelay:           500 * time.Millisecond,
@@ -262,38 +216,15 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 	}
 
 	var endpoint string
-	var issuer string
-
 	switch env {
 	case EnvironmentTest:
 		endpoint = "api.agorainfra.dev:443"
-		if c.opts.kinVersion == 2 {
-			c.network = kin2Testnet
-			issuer = kin.Kin2TestIssuer
-		} else {
-			c.network = testnet
-		}
 	case EnvironmentProd:
 		endpoint = "api.agorainfra.net:443"
-		if c.opts.kinVersion == 2 {
-			c.network = kin2TMainnet
-			issuer = kin.Kin2ProdIssuer
-		} else {
-			c.network = mainnet
-		}
 	default:
 		return nil, errors.Errorf("unknown environment: %s", env)
 	}
 	c.env = env
-
-	if c.opts.kinVersion == 2 {
-		kinIssuer, err := kin.PublicKeyFromString(issuer)
-		if err != nil {
-			return nil, errors.New("failed to convert issuer address to public key")
-		}
-
-		c.opts.kinIssuer = kinIssuer
-	}
 
 	if c.opts.cc != nil && c.opts.endpoint != "" {
 		return nil, errors.New("WithGRPC and WithEndpoint cannot both be set")
@@ -317,7 +248,7 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 		retry.NonRetriableGRPCCodes(codes.Canceled),
 	)
 
-	c.internal = NewInternalClient(c.opts.cc, retrier, c.opts.kinVersion, c.opts.desiredKinVersion)
+	c.internal = NewInternalClient(c.opts.cc, retrier)
 
 	cache, err := lru.New(500)
 	if err != nil {
@@ -330,23 +261,6 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 
 // CreateAccount creates a kin account.
 func (c *client) CreateAccount(ctx context.Context, key kin.PrivateKey, opts ...SolanaOption) error {
-	switch c.opts.kinVersion {
-	case version.KinVersion2, version.KinVersion3:
-		err := c.internal.CreateStellarAccount(ctx, key)
-		if err != nil {
-			if err == ErrBlockchainVersion {
-				c.opts.kinVersion = 4
-				c.internal.kinVersion = 4
-				break
-			}
-			return err
-		}
-		return nil
-	case version.KinVersion4:
-	default:
-		return errors.Errorf("unsupported kin version: %d", c.opts.kinVersion)
-	}
-
 	solanaOpts := solanaOpts{commitment: c.opts.defaultCommitment}
 	for _, o := range opts {
 		o(&solanaOpts)
@@ -365,24 +279,6 @@ func (c *client) CreateAccount(ctx context.Context, key kin.PrivateKey, opts ...
 //
 // ErrAccountDoesNotExist is returned if no account exists.
 func (c *client) GetBalance(ctx context.Context, account kin.PublicKey, opts ...SolanaOption) (int64, error) {
-	switch c.opts.kinVersion {
-	case version.KinVersion2, version.KinVersion3:
-		accountInfo, err := c.internal.GetStellarAccountInfo(ctx, account)
-		if err != nil {
-			if err == ErrBlockchainVersion {
-				c.opts.kinVersion = 4
-				c.internal.kinVersion = 4
-				break
-			}
-			return 0, err
-		}
-
-		return accountInfo.Balance, nil
-	case version.KinVersion4:
-	default:
-		return 0, errors.Errorf("unsupported kin version: %d", c.opts.kinVersion)
-	}
-
 	solanaOpts := solanaOpts{
 		commitment:        c.opts.defaultCommitment,
 		accountResolution: AccountResolutionPreferred,
@@ -414,10 +310,6 @@ func (c *client) GetBalance(ctx context.Context, account kin.PublicKey, opts ...
 }
 
 func (c *client) ResolveTokenAccounts(ctx context.Context, account kin.PublicKey) ([]kin.PublicKey, error) {
-	if c.opts.kinVersion != 4 {
-		return nil, errors.New("`ResolveTokenAccounts` is only available on Kin 4")
-	}
-
 	return c.resolveTokenAccounts(ctx, account)
 }
 
@@ -425,27 +317,16 @@ func (c *client) ResolveTokenAccounts(ctx context.Context, account kin.PublicKey
 //
 // ErrTransactionNotFound is returned if no transaction exists for the hash.
 func (c *client) GetTransaction(ctx context.Context, txID []byte, opts ...SolanaOption) (TransactionData, error) {
-	switch c.opts.kinVersion {
-	case version.KinVersion2, version.KinVersion3:
-		return c.internal.GetStellarTransaction(ctx, txID)
-	case version.KinVersion4:
-		solanaOpts := solanaOpts{commitment: c.opts.defaultCommitment}
-		for _, o := range opts {
-			o(&solanaOpts)
-		}
-
-		return c.internal.GetTransaction(ctx, txID, solanaOpts.commitment)
-	default:
-		return TransactionData{}, errors.Errorf("unsupported kin verion: %d", c.opts.kinVersion)
+	solanaOpts := solanaOpts{commitment: c.opts.defaultCommitment}
+	for _, o := range opts {
+		o(&solanaOpts)
 	}
+
+	return c.internal.GetTransaction(ctx, txID, solanaOpts.commitment)
 }
 
 // SubmitPayment sends a single payment to a specified kin account.
 func (c *client) SubmitPayment(ctx context.Context, payment Payment, opts ...SolanaOption) ([]byte, error) {
-	if c.opts.kinVersion > 4 || c.opts.kinVersion < 2 {
-		return nil, errors.Errorf("unsupported kin version: %d", c.opts.kinVersion)
-	}
-
 	if payment.Invoice != nil && c.opts.appIndex == 0 {
 		return nil, errors.New("cannot submit payment with invoices without an app index")
 	}
@@ -462,103 +343,7 @@ func (c *client) SubmitPayment(ctx context.Context, payment Payment, opts ...Sol
 	var result SubmitTransactionResult
 	var err error
 
-	if c.opts.kinVersion == 4 {
-		result, err = c.submitPaymentWithResolution(ctx, payment, solanaOpts)
-	} else {
-		var signers []kin.PrivateKey
-		if payment.Channel != nil && !bytes.Equal(*payment.Channel, payment.Sender) {
-			signers = []kin.PrivateKey{
-				*payment.Channel,
-				payment.Sender,
-			}
-		} else {
-			signers = []kin.PrivateKey{
-				payment.Sender,
-			}
-		}
-
-		var amount xdr.Int64
-		var asset xdr.Asset
-		switch c.opts.kinVersion {
-		case version.KinVersion2:
-			// On Kin 2, the smallest denomination is 1e-7, unlike on Kin 3, where the smallest amount (a quark) is 1e-5.
-			// We must therefore convert the provided amount from quarks to the Kin 2 base currency accordingly.
-			amount = xdr.Int64(payment.Quarks * 100)
-			asset = xdr.Asset{
-				Type: xdr.AssetTypeAssetTypeCreditAlphanum4,
-				AlphaNum4: &xdr.AssetAlphaNum4{
-					Issuer:    kin.AccountIDFromPublicKey(c.opts.kinIssuer),
-					AssetCode: kinAssetCode,
-				},
-			}
-		default:
-			amount = xdr.Int64(payment.Quarks)
-			asset = xdr.Asset{
-				Type: xdr.AssetTypeAssetTypeNative,
-			}
-		}
-
-		sender := kin.AccountIDFromPublicKey(payment.Sender.Public())
-		envelope := xdr.TransactionEnvelope{
-			Tx: xdr.Transaction{
-				SourceAccount: kin.AccountIDFromPublicKey(signers[0].Public()),
-				Fee:           100,
-				Operations: []xdr.Operation{
-					{
-						SourceAccount: &sender,
-						Body: xdr.OperationBody{
-							Type: xdr.OperationTypePayment,
-							PaymentOp: &xdr.PaymentOp{
-								Destination: kin.AccountIDFromPublicKey(payment.Destination),
-								Amount:      amount,
-								Asset:       asset,
-							},
-						},
-					},
-				},
-			},
-		}
-
-		var invoiceList *commonpb.InvoiceList
-		if payment.Memo != "" {
-			envelope.Tx.Memo = xdr.Memo{
-				Type: xdr.MemoTypeMemoText,
-				Text: &payment.Memo,
-			}
-		} else if c.opts.appIndex > 0 {
-			var fk [sha256.Size224]byte
-
-			if payment.Invoice != nil {
-				invoiceList = &commonpb.InvoiceList{
-					Invoices: []*commonpb.Invoice{
-						payment.Invoice,
-					},
-				}
-				invoiceBytes, err := proto.Marshal(invoiceList)
-				if err != nil {
-					return nil, errors.Wrap(err, "failed to serialize invoice list")
-				}
-				fk = sha256.Sum224(invoiceBytes)
-			}
-
-			m, err := kin.NewMemo(1, payment.Type, c.opts.appIndex, fk[:])
-			if err != nil {
-				return nil, errors.Wrap(err, "failed to create memo")
-			}
-
-			envelope.Tx.Memo = xdr.Memo{
-				Type: xdr.MemoTypeMemoHash,
-				Hash: (*xdr.Hash)(&m),
-			}
-		}
-
-		result, err = c.signAndSubmitXDR(ctx, signers, envelope, invoiceList)
-		if err == ErrBlockchainVersion {
-			c.opts.kinVersion = 4
-			c.internal.kinVersion = 4
-			result, err = c.submitPaymentWithResolution(ctx, payment, solanaOpts)
-		}
-	}
+	result, err = c.submitPaymentWithResolution(ctx, payment, solanaOpts)
 	if err != nil {
 		return result.ID, err
 	}
@@ -589,9 +374,6 @@ func (c *client) SubmitPayment(ctx context.Context, payment Payment, opts ...Sol
 // A batch is limited to 15 earns, which is roughly the max number of transfers
 // that can fit inside a Solana transaction
 func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...SolanaOption) (result EarnBatchResult, err error) {
-	if c.opts.kinVersion > 4 || c.opts.kinVersion < 2 {
-		return result, errors.Errorf("unsupported kin version: %d", c.opts.kinVersion)
-	}
 	if len(batch.Earns) == 0 {
 		return result, errors.New("earn batch must contain at least 1 earn")
 	}
@@ -633,26 +415,18 @@ func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...S
 		o(&solanaOpts)
 	}
 
-	var submitResult SubmitTransactionResult
-	if c.opts.kinVersion == 2 || c.opts.kinVersion == 3 {
-		submitResult, err = c.submitEarnBatch(ctx, batch)
-		if err != nil {
-			return result, err
-		}
-	} else {
-		config, err := c.internal.GetServiceConfig(ctx)
-		if err != nil {
-			return result, err
-		}
+	config, err := c.internal.GetServiceConfig(ctx)
+	if err != nil {
+		return result, err
+	}
 
-		if config.GetSubsidizerAccount() == nil && solanaOpts.subsidizer == nil {
-			return result, ErrNoSubsidizer
-		}
+	if config.GetSubsidizerAccount() == nil && solanaOpts.subsidizer == nil {
+		return result, ErrNoSubsidizer
+	}
 
-		submitResult, err = c.submitEarnBatchWithResolution(ctx, batch, config, solanaOpts)
-		if err != nil {
-			return result, err
-		}
+	submitResult, err := c.submitEarnBatchWithResolution(ctx, batch, config, solanaOpts)
+	if err != nil {
+		return result, err
 	}
 
 	result.TxID = submitResult.ID
@@ -683,8 +457,8 @@ func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...S
 }
 
 func (c *client) RequestAirdrop(ctx context.Context, publicKey kin.PublicKey, quarks uint64, opts ...SolanaOption) ([]byte, error) {
-	if c.env != EnvironmentTest || c.opts.kinVersion != version.KinVersion4 {
-		return nil, errors.New("only available on the Kin 4 test environment")
+	if c.env != EnvironmentTest {
+		return nil, errors.New("only available on the test environment")
 	}
 
 	solanaOpts := solanaOpts{commitment: c.opts.defaultCommitment}
@@ -901,177 +675,6 @@ func (c *client) submitSolanaEarnBatch(ctx context.Context, batch EarnBatch, con
 
 	tx := solana.NewTransaction(ed25519.PublicKey(subsidizerID), instructions...)
 	return c.signAndSubmitTx(ctx, signers, tx, commitment, il, batch.DedupeID)
-}
-
-func (c *client) submitEarnBatch(ctx context.Context, batch EarnBatch) (result SubmitTransactionResult, err error) {
-	var signers []kin.PrivateKey
-	if batch.Channel != nil && !bytes.Equal(*batch.Channel, batch.Sender) {
-		signers = []kin.PrivateKey{
-			*batch.Channel,
-			batch.Sender,
-		}
-	} else {
-		signers = []kin.PrivateKey{
-			batch.Sender,
-		}
-	}
-
-	sender := kin.AccountIDFromPublicKey(batch.Sender.Public())
-	envelope := xdr.TransactionEnvelope{
-		Tx: xdr.Transaction{
-			SourceAccount: kin.AccountIDFromPublicKey(signers[0].Public()),
-			Fee:           100 * xdr.Uint32(len(batch.Earns)),
-		},
-	}
-
-	var quarksToRaw int64
-	var asset xdr.Asset
-	switch c.opts.kinVersion {
-	case version.KinVersion2:
-		// On Kin 2, the smallest denomination is 1e-7, unlike on Kin 3, where the smallest amount (a quark) is 1e-5.
-		// We must therefore convert the provided amount from quarks to the Kin 2 base currency accordingly.
-		quarksToRaw = 100
-		asset = xdr.Asset{
-			Type: xdr.AssetTypeAssetTypeCreditAlphanum4,
-			AlphaNum4: &xdr.AssetAlphaNum4{
-				Issuer:    kin.AccountIDFromPublicKey(c.opts.kinIssuer),
-				AssetCode: kinAssetCode,
-			},
-		}
-	default:
-		quarksToRaw = 1
-		asset = xdr.Asset{
-			Type: xdr.AssetTypeAssetTypeNative,
-		}
-	}
-
-	for _, r := range batch.Earns {
-		envelope.Tx.Operations = append(envelope.Tx.Operations, xdr.Operation{
-			SourceAccount: &sender,
-			Body: xdr.OperationBody{
-				Type: xdr.OperationTypePayment,
-				PaymentOp: &xdr.PaymentOp{
-					Destination: kin.AccountIDFromPublicKey(r.Destination),
-					Amount:      xdr.Int64(r.Quarks * quarksToRaw),
-					Asset:       asset,
-				},
-			},
-		})
-	}
-
-	var invoiceList *commonpb.InvoiceList
-	if batch.Memo != "" {
-		envelope.Tx.Memo = xdr.Memo{
-			Type: xdr.MemoTypeMemoText,
-			Text: &batch.Memo,
-		}
-	} else {
-		invoiceList = &commonpb.InvoiceList{
-			Invoices: make([]*commonpb.Invoice, 0, len(batch.Earns)),
-		}
-
-		for _, r := range batch.Earns {
-			if r.Invoice != nil {
-				invoiceList.Invoices = append(invoiceList.Invoices, r.Invoice)
-			}
-		}
-
-		var fk [sha256.Size224]byte
-		if len(invoiceList.Invoices) > 0 {
-			if len(invoiceList.Invoices) != len(batch.Earns) {
-				return result, errors.Errorf("either all or none of the earns should have an invoice set")
-			}
-			invoiceBytes, err := proto.Marshal(invoiceList)
-			if err != nil {
-				return result, errors.Wrap(err, "failed to serialize invoice list")
-			}
-			fk = sha256.Sum224(invoiceBytes)
-		} else {
-			invoiceList = nil
-		}
-
-		memo, err := kin.NewMemo(1, kin.TransactionTypeEarn, c.opts.appIndex, fk[:])
-		if err != nil {
-			return result, errors.Wrap(err, "failed to create memo")
-		}
-
-		envelope.Tx.Memo = xdr.Memo{
-			Type: xdr.MemoTypeMemoHash,
-			Hash: (*xdr.Hash)(&memo),
-		}
-	}
-
-	result, err = c.signAndSubmitXDR(ctx, signers, envelope, invoiceList)
-	if err != nil {
-		return result, err
-	}
-
-	if len(result.InvoiceErrors) > 0 {
-		// Invoice errors should not be triggered on earns.
-		//
-		// This indicates there is something wrong with the service.
-		return result, errors.New("unexpected invoice errors present")
-	}
-
-	return result, err
-}
-
-func (c *client) signAndSubmitXDR(ctx context.Context, signers []kin.PrivateKey, envelope xdr.TransactionEnvelope, invoiceList *commonpb.InvoiceList) (SubmitTransactionResult, error) {
-	var result SubmitTransactionResult
-
-	senderInfo, err := c.internal.GetStellarAccountInfo(ctx, signers[0].Public())
-	if err != nil {
-		return result, err
-	}
-
-	offset := int64(1)
-	_, err = retry.Retry(
-		func() error {
-			envelope.Tx.SeqNum = xdr.SequenceNumber(senderInfo.SequenceNumber + offset)
-
-			var signedEnvelope *xdr.TransactionEnvelope
-			for _, s := range signers {
-				signedEnvelope, err = stellar.SignEnvelope(&envelope, c.network, s.StellarSeed())
-				if err != nil {
-					return errors.Wrap(err, "failed to sign transaction envelope")
-				}
-			}
-
-			if len(c.opts.whitelistKey) > 0 {
-				var signed bool
-				for _, signer := range signers {
-					if bytes.Equal(c.opts.whitelistKey, signer) {
-						signed = true
-					}
-				}
-				if !signed {
-					signedEnvelope, err = stellar.SignEnvelope(&envelope, c.network, c.opts.whitelistKey.StellarSeed())
-					if err != nil {
-						return errors.Wrap(err, "failed to sign transaction envelope")
-					}
-				}
-			}
-
-			envelopeBytes, err := signedEnvelope.MarshalBinary()
-			if err != nil {
-				return errors.Wrap(err, "failed to marshal transaction envelope")
-			}
-
-			if result, err = c.internal.SubmitStellarTransaction(ctx, envelopeBytes, invoiceList); err != nil {
-				return err
-			}
-			if result.Errors.TxError == ErrBadNonce {
-				offset += 1
-				return ErrBadNonce
-			}
-
-			return nil
-		},
-		retry.Limit(c.opts.maxSequenceRetries),
-		retry.RetriableErrors(ErrBadNonce),
-	)
-
-	return result, err
 }
 
 func (c *client) signAndSubmitTx(ctx context.Context, signers []kin.PrivateKey, tx solana.Transaction, commitment commonpbv4.Commitment, il *commonpb.InvoiceList, dedupeId []byte) (SubmitTransactionResult, error) {

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 
 	"github.com/kinecosystem/agora-common/kin"
-	"github.com/kinecosystem/agora-common/kin/version"
 	"github.com/kinecosystem/agora-common/solana"
 	"github.com/kinecosystem/agora-common/solana/memo"
 	"github.com/kinecosystem/agora-common/solana/token"
@@ -23,8 +22,6 @@ type Payment struct {
 	Destination kin.PublicKey
 	Type        kin.TransactionType
 	Quarks      int64
-
-	Channel *kin.PrivateKey
 
 	Invoice *commonpb.Invoice
 	Memo    string
@@ -51,84 +48,6 @@ type ReadOnlyPayment struct {
 
 	Invoice *commonpb.Invoice
 	Memo    string
-}
-
-func parsePaymentsFromEnvelope(envelope xdr.TransactionEnvelope, txType kin.TransactionType, invoiceList *commonpb.InvoiceList, v version.KinVersion) ([]ReadOnlyPayment, error) {
-	payments := make([]ReadOnlyPayment, 0, len(envelope.Tx.Operations))
-
-	if invoiceList != nil && len(invoiceList.Invoices) != len(envelope.Tx.Operations) {
-		return nil, errors.Errorf(
-			"provided invoice count (%d) does not match op count (%d)",
-			len(invoiceList.Invoices),
-			len(envelope.Tx.Operations),
-		)
-	}
-
-	for i, op := range envelope.Tx.Operations {
-		// Currently we only support payment operations in this RPC.
-		//
-		// We could potentially expand this to CreateAccount functions,
-		// as well as merge account. However, GetTransaction() is primarily
-		// only used for payments.
-		if op.Body.PaymentOp == nil {
-			continue
-		}
-
-		var source xdr.AccountId
-		if op.SourceAccount != nil {
-			source = *op.SourceAccount
-		} else {
-			source = envelope.Tx.SourceAccount
-		}
-
-		sender, err := kin.PublicKeyFromStellarXDR(source)
-		if err != nil {
-			return payments, errors.Wrap(err, "invalid sender account")
-		}
-		dest, err := kin.PublicKeyFromStellarXDR(op.Body.PaymentOp.Destination)
-		if err != nil {
-			return payments, errors.Wrap(err, "invalid destination account")
-		}
-
-		var quarks int64
-		if v == version.KinVersion2 {
-			if op.Body.PaymentOp.Asset.Type != xdr.AssetTypeAssetTypeCreditAlphanum4 || op.Body.PaymentOp.Asset.AlphaNum4.AssetCode != kinAssetCode {
-				// Only Kin payment operations are supported in this RPC.
-				continue
-			}
-
-			// On Kin 2, the smallest denomination is 1e-7, unlike on Kin 3, where the smallest amount (a quark) is 1e-5.
-			// We must therefore convert the payment amount from the base currency to the equivalent amount in quarks
-			// accordingly.
-			quarks = int64(op.Body.PaymentOp.Amount / 100)
-		} else {
-			quarks = int64(op.Body.PaymentOp.Amount)
-		}
-
-		p := ReadOnlyPayment{
-			Sender:      sender,
-			Destination: dest,
-			Quarks:      quarks,
-			Type:        txType,
-		}
-
-		if invoiceList != nil {
-			// This indexing is 'safe', as agora validates on ingestion that
-			// the amount of operations in a transaction matches the amount
-			// of invoices submitted, such that there is a direct mapping
-			// between the transaction Operations and the InvoiceList.
-			//
-			// Additionally, we check they're the same above as an extra
-			// safety measure.
-			p.Invoice = invoiceList.Invoices[i]
-		} else if envelope.Tx.Memo.Text != nil {
-			p.Memo = *envelope.Tx.Memo.Text
-		}
-
-		payments = append(payments, p)
-	}
-
-	return payments, nil
 }
 
 func parsePaymentsFromTransaction(tx solana.Transaction, invoiceList *commonpb.InvoiceList) ([]ReadOnlyPayment, error) {
@@ -301,7 +220,6 @@ func txStateFromProto(state transactionpbv4.GetTransactionResponse_State) Transa
 // sender/source.
 type EarnBatch struct {
 	Sender  kin.PrivateKey
-	Channel *kin.PrivateKey
 
 	Memo string
 

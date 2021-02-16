@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- Remove Stellar (Kin 2 & Kin 3) support
+    - Only Kin 4 and v4 Agora APIs are supported
+    - Removed `WithKinVersion`, `WithWhitelister` and `WithDesiredKinVersion` client options
+    - `Channel` has been removed from `Payment` and `EarnBatch`
+    - `Envelope` and `TxHash()` have been removed from `SignTransactionRequest` 
 
 ## [v0.6.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.6.0)
 - Don't retry on precondition failed
