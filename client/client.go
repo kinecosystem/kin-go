@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -8,12 +9,12 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	lru "github.com/hashicorp/golang-lru"
 	"github.com/kinecosystem/agora-common/kin"
 	"github.com/kinecosystem/agora-common/retry"
 	"github.com/kinecosystem/agora-common/retry/backoff"
 	"github.com/kinecosystem/agora-common/solana"
 	"github.com/kinecosystem/agora-common/solana/memo"
+	"github.com/kinecosystem/agora-common/solana/system"
 	"github.com/kinecosystem/agora-common/solana/token"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -31,6 +32,8 @@ type Environment string
 const (
 	EnvironmentTest Environment = "test"
 	EnvironmentProd Environment = "prod"
+
+	MaxBatchSize = 15
 )
 
 type Client interface {
@@ -44,6 +47,13 @@ type Client interface {
 
 	// ResolveTokenAccounts resolves the token accounts owned by an account on Kin 4.
 	ResolveTokenAccounts(ctx context.Context, account kin.PublicKey) ([]kin.PublicKey, error)
+
+	// MergeTokenAccounts merges the balances of all the token accounts owned by the
+	// specified account into a single token account (the first one returned by ResolveTokenAccounts).
+	//
+	// If createAssociatedAccount is set, the operation will create the associated account
+	// (if it does not exist), and the funds will be sent to the associated account.
+	MergeTokenAccounts(ctx context.Context, account kin.PrivateKey, createAssociatedAccount bool, opts ...SolanaOption) (txID []byte, err error)
 
 	// GetTransaction returns the TransactionData for a given transaction hash.
 	//
@@ -66,8 +76,7 @@ type client struct {
 	internal *InternalClient
 	opts     clientOpts
 
-	env          Environment
-	accountCache *lru.Cache
+	env Environment
 }
 
 type clientOpts struct {
@@ -158,6 +167,7 @@ type solanaOpts struct {
 	accountResolution AccountResolution
 	destResolution    AccountResolution
 	subsidizer        kin.PrivateKey
+	senderCreate      bool
 }
 
 // ClientOption configures a solana-related function call.
@@ -192,9 +202,12 @@ func WithSubsidizer(subsidizer kin.PrivateKey) SolanaOption {
 	}
 }
 
-type tokenAccountEntry struct {
-	created  time.Time
-	accounts []kin.PublicKey
+// WithSenderCreate specifies that destination accounts should be created if they
+// do not exist.
+func WithSenderCreate() SolanaOption {
+	return func(o *solanaOpts) {
+		o.senderCreate = true
+	}
 }
 
 // New creates a new client.
@@ -250,12 +263,6 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 
 	c.internal = NewInternalClient(c.opts.cc, retrier)
 
-	cache, err := lru.New(500)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create token account cache ")
-	}
-	c.accountCache = cache
-
 	return c, nil
 }
 
@@ -267,7 +274,7 @@ func (c *client) CreateAccount(ctx context.Context, key kin.PrivateKey, opts ...
 	}
 	_, err := retry.Retry(
 		func() error {
-			return c.internal.CreateSolanaAccount(ctx, key, solanaOpts.commitment, solanaOpts.subsidizer)
+			return c.internal.CreateSolanaAccount(ctx, key, solanaOpts.commitment, solanaOpts.subsidizer, c.opts.appIndex)
 		},
 		retry.Limit(c.opts.maxSequenceRetries),
 		retry.RetriableErrors(ErrBadNonce),
@@ -289,19 +296,15 @@ func (c *client) GetBalance(ctx context.Context, account kin.PublicKey, opts ...
 
 	accountInfo, err := c.internal.GetSolanaAccountInfo(ctx, account, solanaOpts.commitment)
 	if err == ErrAccountDoesNotExist && solanaOpts.accountResolution == AccountResolutionPreferred {
-		tokenAccounts, tokenErr := c.resolveTokenAccounts(ctx, account)
-		if tokenErr != nil {
-			return 0, tokenErr
-		}
-
-		if len(tokenAccounts) == 0 {
-			return 0, ErrAccountDoesNotExist
-		}
-
-		accountInfo, err = c.internal.GetSolanaAccountInfo(ctx, tokenAccounts[0], solanaOpts.commitment)
+		accountInfos, err := c.internal.ResolveTokenAccounts(ctx, account, true)
 		if err != nil {
 			return 0, err
 		}
+		if len(accountInfos) == 0 {
+			return 0, ErrAccountDoesNotExist
+		}
+
+		return accountInfos[0].Balance, nil
 	} else if err != nil {
 		return 0, err
 	}
@@ -310,7 +313,129 @@ func (c *client) GetBalance(ctx context.Context, account kin.PublicKey, opts ...
 }
 
 func (c *client) ResolveTokenAccounts(ctx context.Context, account kin.PublicKey) ([]kin.PublicKey, error) {
-	return c.resolveTokenAccounts(ctx, account)
+	accountInfos, err := c.internal.ResolveTokenAccounts(ctx, account, false)
+	if err != nil {
+		return nil, err
+	}
+
+	accounts := make([]kin.PublicKey, len(accountInfos))
+	for i := range accountInfos {
+		accounts[i] = accountInfos[i].AccountId.Value
+	}
+	return accounts, nil
+}
+
+func (c *client) MergeTokenAccounts(ctx context.Context, account kin.PrivateKey, createAssociatedAccount bool, opts ...SolanaOption) ([]byte, error) {
+	conf := solanaOpts{
+		commitment: commonpbv4.Commitment_SINGLE,
+	}
+
+	for _, o := range opts {
+		o(&conf)
+	}
+
+	existingAccounts, err := c.internal.ResolveTokenAccounts(ctx, account.Public(), true)
+	if err != nil {
+		return nil, err
+	}
+	if len(existingAccounts) == 0 || !createAssociatedAccount && len(existingAccounts) == 1 {
+		return nil, nil
+	}
+
+	var instructions []solana.Instruction
+	dest := ed25519.PublicKey(existingAccounts[0].AccountId.Value)
+
+	config, err := c.internal.GetServiceConfig(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get service config")
+	}
+
+	var subsidizer ed25519.PublicKey
+	signers := []kin.PrivateKey{account}
+
+	if conf.subsidizer != nil {
+		subsidizer = ed25519.PublicKey(conf.subsidizer.Public())
+		signers = append(signers, conf.subsidizer)
+	} else if len(config.SubsidizerAccount.Value) == ed25519.PublicKeySize {
+		subsidizer = config.SubsidizerAccount.Value
+	} else {
+		return nil, ErrNoSubsidizer
+	}
+
+	if createAssociatedAccount {
+		create, assoc, err := token.CreateAssociatedTokenAccount(
+			subsidizer,
+			ed25519.PublicKey(account.Public()),
+			config.Token.Value,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to generate associated account instruction")
+		}
+
+		if !bytes.Equal(existingAccounts[0].AccountId.Value, assoc) {
+			instructions = append(instructions, create)
+			instructions = append(instructions, token.SetAuthority(
+				assoc,
+				ed25519.PublicKey(account.Public()),
+				subsidizer,
+				token.AuthorityTypeCloseAccount,
+			))
+			dest = assoc
+		} else if len(existingAccounts) == 1 {
+			return nil, nil
+		}
+	}
+
+	for _, existing := range existingAccounts {
+		if bytes.Equal(dest, existing.AccountId.Value) {
+			continue
+		}
+
+		instructions = append(instructions, token.Transfer(
+			existing.AccountId.Value,
+			dest,
+			ed25519.PublicKey(account.Public()),
+			uint64(existing.Balance),
+		))
+
+		// If no close authority is set, it likely means we do not know it, and
+		// can't make any assumptions.
+		if existing.CloseAuthority == nil {
+			continue
+		}
+
+		// If the subsidizer is the close authority, we can include the close instruction
+		// as they will be ok with signing for it.
+		//
+		// Alternatively, if we're the close authority, we are signing it.
+		var shouldClose bool
+		for _, a := range [][]byte{nil, account.Public(), subsidizer} {
+			if bytes.Equal(existing.CloseAuthority.Value, a) {
+				shouldClose = true
+				break
+			}
+		}
+
+		if shouldClose {
+			instructions = append(instructions, token.CloseAccount(
+				existing.AccountId.Value,
+				existing.CloseAuthority.Value,
+				existing.CloseAuthority.Value,
+			))
+		}
+	}
+
+	tx := solana.NewTransaction(
+		subsidizer,
+		instructions...,
+	)
+
+	result, err := c.signAndSubmitTx(ctx, signers, tx, conf.commitment, nil, nil)
+	if err != nil {
+		return result.ID, err
+	}
+
+	return result.ID, result.Errors.TxError
 }
 
 // GetTransaction returns the TransactionData for a given transaction hash.
@@ -374,11 +499,20 @@ func (c *client) SubmitPayment(ctx context.Context, payment Payment, opts ...Sol
 // A batch is limited to 15 earns, which is roughly the max number of transfers
 // that can fit inside a Solana transaction
 func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...SolanaOption) (result EarnBatchResult, err error) {
+	solanaOpts := solanaOpts{
+		commitment:        c.opts.defaultCommitment,
+		accountResolution: AccountResolutionPreferred,
+		destResolution:    AccountResolutionPreferred,
+	}
+	for _, o := range opts {
+		o(&solanaOpts)
+	}
+
 	if len(batch.Earns) == 0 {
 		return result, errors.New("earn batch must contain at least 1 earn")
 	}
-	if len(batch.Earns) > 15 {
-		return result, errors.New("earn batch must not contain more than 15 earns")
+	if len(batch.Earns) > MaxBatchSize {
+		return result, errors.Errorf("earn batch must not contain more than %d earns", MaxBatchSize)
 	}
 
 	// Verify that there isn't a mixed usage of Invoices and text Memos, so we can
@@ -404,15 +538,6 @@ func (c *client) SubmitEarnBatch(ctx context.Context, batch EarnBatch, opts ...S
 	}
 	if err != nil {
 		return result, err
-	}
-
-	solanaOpts := solanaOpts{
-		commitment:        c.opts.defaultCommitment,
-		accountResolution: AccountResolutionPreferred,
-		destResolution:    AccountResolutionPreferred,
-	}
-	for _, o := range opts {
-		o(&solanaOpts)
 	}
 
 	config, err := c.internal.GetServiceConfig(ctx)
@@ -469,7 +594,7 @@ func (c *client) RequestAirdrop(ctx context.Context, publicKey kin.PublicKey, qu
 	return c.internal.RequestAirdrop(ctx, publicKey, quarks, solanaOpts.commitment)
 }
 
-func (c *client) submitPaymentWithResolution(ctx context.Context, payment Payment, solanaOpts solanaOpts) (result SubmitTransactionResult, err error) {
+func (c *client) submitPaymentWithResolution(ctx context.Context, p Payment, solanaOpts solanaOpts) (result SubmitTransactionResult, err error) {
 	config, err := c.internal.GetServiceConfig(ctx)
 	if err != nil {
 		return result, errors.Wrap(err, "failed to get service config")
@@ -479,66 +604,124 @@ func (c *client) submitPaymentWithResolution(ctx context.Context, payment Paymen
 		return SubmitTransactionResult{}, ErrNoSubsidizer
 	}
 
+	var subsidizer ed25519.PublicKey
+	if solanaOpts.subsidizer != nil {
+		subsidizer = ed25519.PublicKey(solanaOpts.subsidizer.Public())
+	} else {
+		subsidizer = config.SubsidizerAccount.GetValue()
+	}
+
 	var transferSender kin.PublicKey
-	result, err = c.submitSolanaPayment(ctx, payment, config, solanaOpts.commitment, transferSender, solanaOpts.subsidizer)
+	internalPayment := payment{
+		Payment: p,
+	}
+
+	// Optimistically send the payment (without resolution)
+	result, err = c.submitSolanaPayment(ctx, internalPayment, config, solanaOpts.commitment, transferSender, solanaOpts.subsidizer)
 	if err != nil {
 		return result, err
 	}
+	if result.Errors.TxError != ErrAccountDoesNotExist {
+		return result, err
+	}
 
-	if result.Errors.TxError == ErrAccountDoesNotExist {
-		var resubmit bool
-		if solanaOpts.accountResolution == AccountResolutionPreferred {
-			tokenAccounts, err := c.resolveTokenAccounts(ctx, payment.Sender.Public())
-			if err != nil {
-				return result, err
-			}
-			if len(tokenAccounts) > 0 {
-				transferSender = tokenAccounts[0]
-				resubmit = true
-			}
-		}
-		if solanaOpts.destResolution == AccountResolutionPreferred {
-			tokenAccounts, err := c.resolveTokenAccounts(ctx, payment.Destination)
-			if err != nil {
-				return result, err
-			}
-			if len(tokenAccounts) > 0 {
-				payment.Destination = tokenAccounts[0]
-				resubmit = true
-			}
+	var resubmit bool
+	if solanaOpts.accountResolution == AccountResolutionPreferred {
+		tokenAccounts, err := c.internal.ResolveTokenAccounts(ctx, internalPayment.Sender.Public(), false)
+		if err != nil {
+			return result, err
 		}
 
-		if resubmit {
-			result, err = c.submitSolanaPayment(ctx, payment, config, solanaOpts.commitment, transferSender, solanaOpts.subsidizer)
+		if len(tokenAccounts) > 0 {
+			transferSender = tokenAccounts[0].AccountId.Value
+			resubmit = true
 		}
+	}
+	if solanaOpts.destResolution == AccountResolutionPreferred {
+		tokenAccounts, err := c.internal.ResolveTokenAccounts(ctx, internalPayment.Destination, false)
+		if err != nil {
+			return result, err
+		}
+
+		if len(tokenAccounts) > 0 {
+			internalPayment.Destination = tokenAccounts[0].AccountId.Value
+			resubmit = true
+		} else if solanaOpts.senderCreate {
+			lamports, err := c.internal.GetMinimumBalanceForRentException(ctx, token.AccountSize)
+			if err != nil {
+				return result, errors.Wrap(err, "failed to get minimum lamports")
+			}
+
+			pub, priv, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				return result, errors.Wrap(err, "failed to generate temporary key")
+			}
+
+			internalPayment.Destination = kin.PublicKey(pub)
+			internalPayment.createAccountInstructions = []solana.Instruction{
+				system.CreateAccount(
+					subsidizer,
+					pub,
+					token.ProgramKey,
+					lamports,
+					token.AccountSize,
+				),
+				token.InitializeAccount(
+					pub,
+					config.Token.Value,
+					pub,
+				),
+				token.SetAuthority(
+					pub,
+					pub,
+					subsidizer,
+					token.AuthorityTypeCloseAccount,
+				),
+				token.SetAuthority(
+					pub,
+					pub,
+					ed25519.PublicKey(p.Destination),
+					token.AuthorityTypeAccountHolder,
+				),
+			}
+			internalPayment.createAccountSigner = priv
+			resubmit = true
+		}
+	}
+
+	if resubmit {
+		result, err = c.submitSolanaPayment(ctx, internalPayment, config, solanaOpts.commitment, transferSender, solanaOpts.subsidizer)
 	}
 
 	return result, err
 }
 
-func (c *client) submitSolanaPayment(ctx context.Context, payment Payment, config *transactionpbv4.GetServiceConfigResponse, commitment commonpbv4.Commitment, transferSender kin.PublicKey, subsidizer kin.PrivateKey) (SubmitTransactionResult, error) {
+func (c *client) submitSolanaPayment(ctx context.Context, p payment, config *transactionpbv4.GetServiceConfigResponse, commitment commonpbv4.Commitment, transferSource kin.PublicKey, subsidizer kin.PrivateKey) (SubmitTransactionResult, error) {
 	var subsidizerID kin.PublicKey
 	var signers []kin.PrivateKey
 	if subsidizer != nil {
 		subsidizerID = subsidizer.Public()
-		signers = []kin.PrivateKey{subsidizer, payment.Sender}
+		signers = []kin.PrivateKey{subsidizer, p.Sender}
 	} else {
 		subsidizerID = config.GetSubsidizerAccount().GetValue()
-		signers = []kin.PrivateKey{payment.Sender}
+		signers = []kin.PrivateKey{p.Sender}
+	}
+	if len(p.createAccountSigner) == ed25519.PrivateKeySize {
+		signers = append(signers, kin.PrivateKey(p.createAccountSigner))
 	}
 
 	var instructions []solana.Instruction
 	var il *commonpb.InvoiceList
 
-	if payment.Memo != "" {
-		instructions = append(instructions, memo.Instruction(payment.Memo))
+	if p.Memo != "" {
+		instructions = append(instructions, memo.Instruction(p.Memo))
 	} else if c.opts.appIndex > 0 {
 		var fk [sha256.Size224]byte
 
-		if payment.Invoice != nil {
+		if p.Invoice != nil {
 			il = &commonpb.InvoiceList{
 				Invoices: []*commonpb.Invoice{
-					payment.Invoice,
+					p.Invoice,
 				},
 			}
 			invoiceBytes, err := proto.Marshal(il)
@@ -548,7 +731,7 @@ func (c *client) submitSolanaPayment(ctx context.Context, payment Payment, confi
 			fk = sha256.Sum224(invoiceBytes)
 		}
 
-		m, err := kin.NewMemo(1, payment.Type, c.opts.appIndex, fk[:])
+		m, err := kin.NewMemo(1, p.Type, c.opts.appIndex, fk[:])
 		if err != nil {
 			return SubmitTransactionResult{}, errors.Wrap(err, "failed to create memo")
 		}
@@ -556,22 +739,23 @@ func (c *client) submitSolanaPayment(ctx context.Context, payment Payment, confi
 		instructions = append(instructions, memo.Instruction(base64.StdEncoding.EncodeToString(m[:])))
 	}
 
-	if transferSender == nil {
-		transferSender = payment.Sender.Public()
+	if transferSource == nil {
+		transferSource = p.Sender.Public()
 	}
 
+	instructions = append(instructions, p.createAccountInstructions...)
 	instructions = append(
 		instructions,
 		token.Transfer(
-			ed25519.PublicKey(transferSender),
-			ed25519.PublicKey(payment.Destination),
-			ed25519.PublicKey(payment.Sender.Public()),
-			uint64(payment.Quarks),
+			ed25519.PublicKey(transferSource),
+			ed25519.PublicKey(p.Destination),
+			ed25519.PublicKey(p.Sender.Public()),
+			uint64(p.Quarks),
 		),
 	)
 
 	tx := solana.NewTransaction(ed25519.PublicKey(subsidizerID), instructions...)
-	return c.signAndSubmitTx(ctx, signers, tx, commitment, il, payment.DedupeID)
+	return c.signAndSubmitTx(ctx, signers, tx, commitment, il, p.DedupeID)
 }
 
 func (c *client) submitEarnBatchWithResolution(ctx context.Context, batch EarnBatch, config *transactionpbv4.GetServiceConfigResponse, solanaOpts solanaOpts) (SubmitTransactionResult, error) {
@@ -584,23 +768,23 @@ func (c *client) submitEarnBatchWithResolution(ctx context.Context, batch EarnBa
 	if result.Errors.TxError == ErrAccountDoesNotExist {
 		var resubmit bool
 		if solanaOpts.accountResolution == AccountResolutionPreferred {
-			tokenAccounts, err := c.resolveTokenAccounts(ctx, batch.Sender.Public())
+			tokenAccounts, err := c.internal.ResolveTokenAccounts(ctx, batch.Sender.Public(), false)
 			if err != nil {
 				return result, err
 			}
 			if len(tokenAccounts) > 0 {
-				transferSender = tokenAccounts[0]
+				transferSender = tokenAccounts[0].AccountId.Value
 				resubmit = true
 			}
 		}
 		if solanaOpts.destResolution == AccountResolutionPreferred {
 			for i, earn := range batch.Earns {
-				tokenAccounts, err := c.resolveTokenAccounts(ctx, earn.Destination)
+				tokenAccounts, err := c.internal.ResolveTokenAccounts(ctx, earn.Destination, false)
 				if err != nil {
 					return result, err
 				}
 				if len(tokenAccounts) > 0 {
-					batch.Earns[i].Destination = tokenAccounts[0]
+					batch.Earns[i].Destination = tokenAccounts[0].AccountId.Value
 					resubmit = true
 				}
 			}
@@ -684,6 +868,8 @@ func (c *client) signAndSubmitTx(ctx context.Context, signers []kin.PrivateKey, 
 		keys[i] = ed25519.PrivateKey(signer)
 	}
 
+	var emptySig [ed25519.SignatureSize]byte
+
 	_, err := retry.Retry(
 		func() error {
 			blockhash, err := c.internal.GetRecentBlockhash(ctx)
@@ -698,10 +884,42 @@ func (c *client) signAndSubmitTx(ctx context.Context, signers []kin.PrivateKey, 
 				return err
 			}
 
-			if result, err = c.internal.SubmitSolanaTransaction(ctx, tx, il, commitment, dedupeId); err != nil {
+			// If the transaction isn't subsidized, request a signature.
+			var remoteSigned bool
+			if tx.Signatures[0] == (solana.Signature{}) {
+				signResult, err := c.internal.SignTransaction(ctx, tx, il)
+				if err != nil {
+					return err
+				}
+
+				if len(signResult.InvoiceErrors) != 0 {
+					result.InvoiceErrors = signResult.InvoiceErrors
+					return nil
+				}
+
+				if bytes.Equal(signResult.ID, emptySig[:]) {
+					return ErrPayerRequired
+				}
+
+				remoteSigned = true
+				copy(tx.Signatures[0][:], signResult.ID)
+			}
+
+			result, err = c.internal.SubmitSolanaTransaction(ctx, tx, il, commitment, dedupeId)
+			result.ID = tx.Signature()
+			if err != nil {
 				return err
 			}
+
 			if result.Errors.TxError == ErrBadNonce {
+				// If we encounter a bad nonce, _and_ we've remote signed the transaction,
+				// then we need to clear the state so the next iteration will properly
+				// request a new signature (with the updated block hash)
+				if remoteSigned {
+					result.ID = nil
+					tx.Signatures[0] = solana.Signature{}
+				}
+
 				return ErrBadNonce
 			}
 
@@ -712,41 +930,4 @@ func (c *client) signAndSubmitTx(ctx context.Context, signers []kin.PrivateKey, 
 	)
 
 	return result, err
-}
-
-func (c *client) resolveTokenAccounts(ctx context.Context, account kin.PublicKey) (accounts []kin.PublicKey, err error) {
-	cached, ok := c.accountCache.Get(account.Base58())
-	if ok {
-		entry := cached.(*tokenAccountEntry)
-		if time.Since(entry.created) < 5*time.Minute {
-			return entry.accounts, nil
-		}
-		c.accountCache.Remove(account.Base58())
-	}
-
-	_, err = retry.Retry(
-		func() error {
-			accounts, err = c.internal.ResolveTokenAccounts(ctx, account)
-			if err != nil {
-				return err
-			}
-
-			if len(accounts) == 0 {
-				return errNoTokenAccounts
-			}
-			return nil
-		},
-		retry.Limit(c.opts.maxRetries),
-		retry.RetriableErrors(errNoTokenAccounts),
-	)
-
-	if len(accounts) == 0 {
-		return []kin.PublicKey{}, nil
-	}
-
-	c.accountCache.Add(account.Base58(), &tokenAccountEntry{
-		created:  time.Now(),
-		accounts: accounts,
-	})
-	return accounts, nil
 }

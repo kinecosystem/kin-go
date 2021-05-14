@@ -1,6 +1,8 @@
 package client
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,6 +14,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/kinecosystem/agora-common/kin"
 	"github.com/kinecosystem/agora-common/solana"
+	"github.com/kinecosystem/agora-common/webhook/createaccount"
 	"github.com/kinecosystem/agora-common/webhook/events"
 	"github.com/kinecosystem/agora-common/webhook/signtransaction"
 	"github.com/pkg/errors"
@@ -67,6 +70,125 @@ func EventsHandler(secret string, f EventsFunc) http.HandlerFunc {
 	}
 }
 
+type CreateAccountFunc func(CreateAccountRequest, *CreateAccountResponse) error
+
+type CreateAccountRequest struct {
+	Creation    Creation
+	Transaction *solana.Transaction
+}
+
+type CreateAccountResponse struct {
+	rejected bool
+	tx       *solana.Transaction
+}
+
+// Sign signs the underlying transaction with the specified private key.
+func (c *CreateAccountResponse) Sign(priv kin.PrivateKey) (err error) {
+	if len(c.tx.Signatures) > len(c.tx.Message.Accounts) {
+		return errors.New("invalid transaction: more signers than accounts")
+	}
+
+	// Check to see if our public key corresponds to a signer
+	if bytes.Equal(priv.Public(), c.tx.Message.Accounts[0]) {
+		return c.tx.Sign(ed25519.PrivateKey(priv))
+	}
+
+	return nil
+}
+
+func (c *CreateAccountResponse) Reject() {
+	c.rejected = true
+}
+
+func CreateAccountHandler(secret string, f CreateAccountFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to ready body", http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		if len(secret) > 0 {
+			if err := verifySignature(r.Header, body, []byte(secret)); err != nil {
+				http.Error(w, "", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		var createRequest createaccount.Request
+		if err = json.Unmarshal(body, &createRequest); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+
+		// If no kin version is set, default to Kin 4
+		if createRequest.KinVersion == 0 {
+			createRequest.KinVersion = 4
+		}
+
+		if createRequest.KinVersion != 4 {
+			http.Error(w, fmt.Sprintf("unsupported kin version %d", createRequest.KinVersion), http.StatusBadRequest)
+			return
+		}
+
+		var tx solana.Transaction
+		if err := tx.Unmarshal(createRequest.SolanaTransaction); err != nil {
+			http.Error(w, "invalid solana tx", http.StatusBadRequest)
+			return
+		}
+
+		req := CreateAccountRequest{
+			Transaction: &tx,
+		}
+		resp := CreateAccountResponse{
+			tx: &tx,
+		}
+
+		creations, payments, err := parseTransaction(*req.Transaction, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(payments) != 0 {
+			http.Error(w, "unexpected payments present", http.StatusBadRequest)
+			return
+		}
+		if len(creations) != 1 {
+			http.Error(w, fmt.Sprintf("expected exactly 1 creation, got %d", len(creations)), http.StatusBadRequest)
+			return
+		}
+
+		req.Creation = creations[0]
+
+		if err := f(req, &resp); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		encoder := json.NewEncoder(w)
+
+		if resp.rejected {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		successResp := createaccount.SuccessResponse{}
+		if resp.tx.Signatures[0] != (solana.Signature{}) {
+			successResp.Signature = resp.tx.Signature()
+		}
+		if err := encoder.Encode(&successResp); err != nil {
+			http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		}
+	}
+}
+
 // SignTransactionFunc is a callback function for the SignTransaction webhook.
 //
 // If an error is returned, an InternalServer error is returned
@@ -89,6 +211,9 @@ type SignTransactionRequest struct {
 	UserID string
 	// The UserPassKey provided by the client (optional).
 	UserPasskey string
+
+	// Account creations required for payments.
+	Creations []Creation
 
 	// Payments is a set of payments that a client wishes to be signed.
 	Payments []ReadOnlyPayment
@@ -117,11 +242,20 @@ func (s *SignTransactionRequest) TxID() ([]byte, error) {
 type SignTransactionResponse struct {
 	rejected bool
 	errors   []signtransaction.InvoiceError
+	tx       *solana.Transaction
 }
 
-// Sign signs the underlying transaction with the specified private key. No-op on Kin 4 transactions.
+// Sign signs the underlying transaction with the specified private key.
 func (r *SignTransactionResponse) Sign(priv kin.PrivateKey) (err error) {
-	// TODO: sign solana transactions
+	if len(r.tx.Signatures) > len(r.tx.Message.Accounts) {
+		return errors.New("invalid transaction: more signers than accounts")
+	}
+
+	// Check to see if our public key corresponds to a signer
+	if bytes.Equal(priv.Public(), r.tx.Message.Accounts[0]) {
+		return r.tx.Sign(ed25519.PrivateKey(priv))
+	}
+
 	return nil
 }
 
@@ -225,7 +359,6 @@ func SignTransactionHandler(env Environment, secret string, f SignTransactionFun
 			UserPasskey: r.Header.Get(AppUserPasskeyHeader),
 		}
 
-		resp := &SignTransactionResponse{}
 		var tx solana.Transaction
 		if err = tx.Unmarshal(signRequest.SolanaTransaction); err != nil {
 			http.Error(w, "invalid solana tx", http.StatusBadRequest)
@@ -233,10 +366,14 @@ func SignTransactionHandler(env Environment, secret string, f SignTransactionFun
 		}
 
 		req.SolanaTransaction = &tx
-		req.Payments, err = parsePaymentsFromTransaction(tx, invoiceList)
+		req.Creations, req.Payments, err = parseTransaction(tx, invoiceList)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+
+		resp := &SignTransactionResponse{
+			tx: req.SolanaTransaction,
 		}
 
 		if err := f(req, resp); err != nil {
@@ -262,6 +399,9 @@ func SignTransactionHandler(env Environment, secret string, f SignTransactionFun
 		}
 
 		successResp := signtransaction.SuccessResponse{}
+		if resp.tx.Signatures[0] != (solana.Signature{}) {
+			successResp.Signature = resp.tx.Signature()
+		}
 		if err = encoder.Encode(&successResp); err != nil {
 			http.Error(w, "failed to encode response", http.StatusInternalServerError)
 		}

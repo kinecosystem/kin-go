@@ -17,9 +17,9 @@ var (
 	ErrTransactionNotFound = errors.New("transaction not found")
 
 	// Transaction errors.
-	ErrBadNonce                = errors.New("bad nonce")
-	ErrInsufficientBalance     = errors.New("insufficient balance")
-	ErrInvalidSignature        = errors.New("invalid signature")
+	ErrBadNonce            = errors.New("bad nonce")
+	ErrInsufficientBalance = errors.New("insufficient balance")
+	ErrInvalidSignature    = errors.New("invalid signature")
 
 	// Invoice Errors
 	ErrAlreadyPaid      = errors.New("invoice already paid")
@@ -32,8 +32,6 @@ var (
 	ErrAlreadySubmitted    = errors.New("transaction already submitted")
 
 	ErrBlockchainVersion = errors.New("unsupported blockchain version")
-
-	errNoTokenAccounts  = errors.New("no token accounts")
 
 	// nonRetriableErrors contains the set of errors that
 	// should not be retried without modifications to the
@@ -84,7 +82,7 @@ func errorsFromSolanaTx(tx *solana.Transaction, protoError *commonpbv4.Transacti
 		paymentCount := 0
 
 		for i := range tx.Message.Instructions {
-			_, err := token.DecompileTransferAccount(tx.Message, i)
+			_, err := token.DecompileTransfer(tx.Message, i)
 			if err == nil {
 				paymentCount++
 			} else if i < int(protoError.GetInstructionIndex()) {

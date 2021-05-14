@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## [v0.7.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.6.0)
 - Remove Stellar (Kin 2 & Kin 3) support
     - Only Kin 4 and v4 Agora APIs are supported
     - Removed `WithKinVersion`, `WithWhitelister` and `WithDesiredKinVersion` client options
     - `Channel` has been removed from `Payment` and `EarnBatch`
-    - `Envelope` and `TxHash()` have been removed from `SignTransactionRequest` 
+    - `Envelope` and `TxHash()` have been removed from `SignTransactionRequest`
+- CreateAccount now creates associated token accounts
+- Add sender create support for `SubmitPayment`
+- Add `MergeTokenAccounts` to `Client`
+- Add create account webhook support
+- Add creation parsing to `SignTransactionRequest` request
+- `SignTransactionResponse.Sign` now signs Solana transactions
 
 ## [v0.6.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.6.0)
 - Don't retry on precondition failed

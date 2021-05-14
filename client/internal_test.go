@@ -16,9 +16,9 @@ import (
 	"github.com/kinecosystem/agora-common/kin/version"
 	"github.com/kinecosystem/agora-common/solana"
 	solanamemo "github.com/kinecosystem/agora-common/solana/memo"
-	"github.com/kinecosystem/agora-common/solana/system"
 	"github.com/kinecosystem/agora-common/solana/token"
 	agoratestutil "github.com/kinecosystem/agora-common/testutil"
+	"github.com/mr-tron/base58/base58"
 	"github.com/pkg/errors"
 	"github.com/stellar/go/xdr"
 	"github.com/stretchr/testify/assert"
@@ -98,18 +98,20 @@ func TestInternal_SolanaAccountRoundTrip(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
 
-	tokenKey, tokenProgram, subsidizer := setServiceConfigResp(t, env.v4Server, true)
+	tokenKey, _, subsidizer := setServiceConfigResp(t, env.v4Server, true)
 
 	priv, err := kin.NewPrivateKey()
 	require.NoError(t, err)
-	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+
+	tokenAcc, err := token.GetAssociatedAccount(ed25519.PublicKey(priv.Public()), tokenKey)
+	require.NoError(t, err)
 
 	accountInfo, err := env.internal.GetSolanaAccountInfo(context.Background(), kin.PublicKey(tokenAcc), commonpbv4.Commitment_SINGLE)
 	assert.Nil(t, accountInfo)
 	assert.Equal(t, ErrAccountDoesNotExist, err)
 
-	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil))
-	assert.Equal(t, ErrAccountExists, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil))
+	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil, 0))
+	assert.Equal(t, ErrAccountExists, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil, 0))
 
 	accountInfo, err = env.internal.GetSolanaAccountInfo(context.Background(), kin.PublicKey(tokenAcc), commonpbv4.Commitment_SINGLE)
 	assert.NoError(t, err)
@@ -124,25 +126,18 @@ func TestInternal_SolanaAccountRoundTrip(t *testing.T) {
 
 	tx := solana.Transaction{}
 	require.NoError(t, tx.Unmarshal(createReq.Transaction.Value))
-	assert.Len(t, tx.Signatures, 3)
-	assert.True(t, ed25519.Verify(tokenAcc, tx.Message.Marshal(), tx.Signatures[1][:]))
-	assert.True(t, ed25519.Verify(ed25519.PublicKey(priv.Public()), tx.Message.Marshal(), tx.Signatures[2][:]))
+	assert.Equal(t, 2, len(tx.Signatures))
+	assert.EqualValues(t, subsidizer, tx.Message.Accounts[0])
+	assert.True(t, ed25519.Verify(ed25519.PublicKey(priv.Public()), tx.Message.Marshal(), tx.Signatures[1][:]))
 
-	sysCreate, err := system.DecompileCreateAccount(tx.Message, 0)
+	create, err := token.DecompileCreateAssociatedAccount(tx.Message, 0)
 	require.NoError(t, err)
-	assert.Equal(t, subsidizer, sysCreate.Funder)
-	assert.EqualValues(t, tokenAcc, sysCreate.Address)
-	assert.Equal(t, tokenProgram, sysCreate.Owner)
-	assert.Equal(t, MinBalanceForRentException, sysCreate.Lamports)
-	assert.Equal(t, token.AccountSize, int(sysCreate.Size))
+	assert.Equal(t, subsidizer, create.Subsidizer)
+	assert.EqualValues(t, tokenAcc, create.Address)
+	assert.EqualValues(t, priv.Public(), create.Owner)
+	assert.EqualValues(t, tokenKey, create.Mint)
 
-	tokenInit, err := token.DecompileInitializeAccount(tx.Message, 1)
-	require.NoError(t, err)
-	assert.EqualValues(t, tokenAcc, tokenInit.Account)
-	assert.Equal(t, tokenKey, tokenInit.Mint)
-	assert.EqualValues(t, priv.Public(), tokenInit.Owner)
-
-	setAuth, err := token.DecompileSetAuthority(tx.Message, 2)
+	setAuth, err := token.DecompileSetAuthority(tx.Message, 1)
 	require.NoError(t, err)
 	assert.EqualValues(t, tokenAcc, setAuth.Account)
 	assert.EqualValues(t, priv.Public(), setAuth.CurrentAuthority)
@@ -154,9 +149,12 @@ func TestInternal_GetEvents(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
 
+	tokenKey, _, _ := setServiceConfigResp(t, env.v4Server, true)
+
 	priv, err := kin.NewPrivateKey()
 	require.NoError(t, err)
-	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+	tokenAcc, err := token.GetAssociatedAccount(ed25519.PublicKey(priv.Public()), tokenKey)
+	require.NoError(t, err)
 
 	// Test Error
 	env.v4Server.Mux.Lock()
@@ -189,8 +187,7 @@ func TestInternal_GetEvents(t *testing.T) {
 	assert.False(t, ok)
 
 	// Test receiving Events
-	setServiceConfigResp(t, env.v4Server, true)
-	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil))
+	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil, 0))
 
 	events := []*accountpbv4.Events{
 		{
@@ -293,19 +290,20 @@ func TestInternal_CreateNoServiceSubsidizer(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
 
-	tokenKey, tokenProgram, _ := setServiceConfigResp(t, env.v4Server, false)
+	tokenKey, _, _ := setServiceConfigResp(t, env.v4Server, false)
 
 	priv, err := kin.NewPrivateKey()
 	require.NoError(t, err)
-	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+	tokenAcc, err := token.GetAssociatedAccount(ed25519.PublicKey(priv.Public()), tokenKey)
+	require.NoError(t, err)
 
-	err = env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil)
+	err = env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil, 0)
 	require.Equal(t, ErrNoSubsidizer, err)
 
 	subsidizer, err := kin.NewPrivateKey()
 	require.NoError(t, err)
 
-	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, subsidizer))
+	assert.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, subsidizer, 0))
 
 	env.v4Server.Mux.Lock()
 	assert.Len(t, env.v4Server.Creates, 1)
@@ -314,26 +312,18 @@ func TestInternal_CreateNoServiceSubsidizer(t *testing.T) {
 
 	tx := solana.Transaction{}
 	require.NoError(t, tx.Unmarshal(createReq.Transaction.Value))
-	assert.Len(t, tx.Signatures, 3)
+	assert.Equal(t, 2, len(tx.Signatures))
 	assert.True(t, ed25519.Verify(ed25519.PublicKey(subsidizer.Public()), tx.Message.Marshal(), tx.Signatures[0][:]))
-	assert.True(t, ed25519.Verify(tokenAcc, tx.Message.Marshal(), tx.Signatures[1][:]))
-	assert.True(t, ed25519.Verify(ed25519.PublicKey(priv.Public()), tx.Message.Marshal(), tx.Signatures[2][:]))
+	assert.True(t, ed25519.Verify(ed25519.PublicKey(priv.Public()), tx.Message.Marshal(), tx.Signatures[1][:]))
 
-	sysCreate, err := system.DecompileCreateAccount(tx.Message, 0)
+	create, err := token.DecompileCreateAssociatedAccount(tx.Message, 0)
 	require.NoError(t, err)
-	assert.EqualValues(t, subsidizer.Public(), sysCreate.Funder)
-	assert.EqualValues(t, tokenAcc, sysCreate.Address)
-	assert.Equal(t, tokenProgram, sysCreate.Owner)
-	assert.Equal(t, MinBalanceForRentException, sysCreate.Lamports)
-	assert.Equal(t, token.AccountSize, int(sysCreate.Size))
+	assert.EqualValues(t, subsidizer.Public(), create.Subsidizer)
+	assert.EqualValues(t, tokenAcc, create.Address)
+	assert.EqualValues(t, priv.Public(), create.Owner)
+	assert.EqualValues(t, tokenKey, create.Mint)
 
-	tokenInit, err := token.DecompileInitializeAccount(tx.Message, 1)
-	require.NoError(t, err)
-	assert.EqualValues(t, tokenAcc, tokenInit.Account)
-	assert.Equal(t, tokenKey, tokenInit.Mint)
-	assert.EqualValues(t, priv.Public(), tokenInit.Owner)
-
-	setAuth, err := token.DecompileSetAuthority(tx.Message, 2)
+	setAuth, err := token.DecompileSetAuthority(tx.Message, 1)
 	require.NoError(t, err)
 	assert.EqualValues(t, tokenAcc, setAuth.Account)
 	assert.EqualValues(t, priv.Public(), setAuth.CurrentAuthority)
@@ -469,6 +459,111 @@ func TestInternal_GetTransactionWithError(t *testing.T) {
 
 	// Assert the error
 	assert.Equal(t, ErrBadNonce, actual.Errors.TxError)
+}
+
+func TestInternal_SignTransaction(t *testing.T) {
+	env, cleanup := setup(t)
+	defer cleanup()
+
+	// Test happy path (hash is returned)
+	sender, senderKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	dest, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+
+	tx := solana.NewTransaction(
+		sender,
+		token.Transfer(sender, dest, sender, 10),
+	)
+	require.NoError(t, tx.Sign(senderKey))
+
+	txSig := tx.Signature()
+	il := &commonpb.InvoiceList{
+		Invoices: []*commonpb.Invoice{
+			{
+				Items: []*commonpb.Invoice_LineItem{
+					{
+						Title: "hi",
+					},
+				},
+			},
+		},
+	}
+
+	result, err := env.internal.SignTransaction(context.Background(), tx, il)
+	require.NoError(t, err)
+	assert.EqualValues(t, txSig, result.ID)
+	assert.Empty(t, result.InvoiceErrors)
+
+	// Verify server received what was expected
+	env.v4Server.Mux.Lock()
+	assert.Equal(t, 1, len(env.v4Server.Signs))
+	req := env.v4Server.Signs[0]
+	assert.Equal(t, tx.Marshal(), req.Transaction.Value)
+	assert.True(t, proto.Equal(il, req.InvoiceList))
+
+	env.v4Server.Mux.Unlock()
+
+	invoiceErrors := make([]*commonpb.InvoiceError, 3)
+	for i := 0; i < len(invoiceErrors); i++ {
+		invoiceErrors[i] = &commonpb.InvoiceError{
+			OpIndex: 0,
+			Reason:  commonpb.InvoiceError_ALREADY_PAID,
+			Invoice: &commonpb.Invoice{
+				Items: []*commonpb.Invoice_LineItem{
+					{
+						Title:  "invoice%d",
+						Amount: 0,
+					},
+				},
+			},
+		}
+	}
+	// Test invoice errors propagation
+	env.v4Server.Mux.Lock()
+	env.v4Server.SignResponses = []*transactionpbv4.SignTransactionResponse{
+		{
+			Signature: &commonpbv4.TransactionSignature{
+				Value: txSig[:],
+			},
+			Result:        transactionpbv4.SignTransactionResponse_INVOICE_ERROR,
+			InvoiceErrors: invoiceErrors,
+		},
+	}
+	env.v4Server.Mux.Unlock()
+
+	result, err = env.internal.SignTransaction(context.Background(), tx, nil)
+	assert.NoError(t, err)
+	assert.EqualValues(t, txSig[:], result.ID)
+	assert.Len(t, result.InvoiceErrors, len(invoiceErrors))
+	for i := 0; i < len(result.InvoiceErrors); i++ {
+		assert.True(t, proto.Equal(result.InvoiceErrors[i], invoiceErrors[i]))
+	}
+
+	// Test raised exceptions
+	for _, tc := range []struct {
+		result transactionpbv4.SignTransactionResponse_Result
+		err    error
+	}{
+		{
+			result: transactionpbv4.SignTransactionResponse_REJECTED,
+			err:    ErrTransactionRejected,
+		},
+	} {
+		env.v4Server.Mux.Lock()
+		env.v4Server.SignResponses = []*transactionpbv4.SignTransactionResponse{
+			{
+				Signature: &commonpbv4.TransactionSignature{
+					Value: txSig[:],
+				},
+				Result: tc.result,
+			},
+		}
+		env.v4Server.Mux.Unlock()
+
+		result, err = env.internal.SignTransaction(context.Background(), tx, nil)
+		assert.Equal(t, tc.err, err)
+	}
 }
 
 func TestInternal_SubmitSolanaTransaction(t *testing.T) {
@@ -685,17 +780,19 @@ func TestInternal_RequestAirdrop(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
 
+	tokenKey, _, _ := setServiceConfigResp(t, env.v4Server, true)
+
 	priv, err := kin.NewPrivateKey()
 	require.NoError(t, err)
-	tokenAcc, _ := generateTokenAccount(ed25519.PrivateKey(priv))
+	tokenAcc, err := token.GetAssociatedAccount(ed25519.PublicKey(priv.Public()), tokenKey)
+	require.NoError(t, err)
 
 	// Account doesn't exist
 	txID, err := env.internal.RequestAirdrop(context.Background(), kin.PublicKey(tokenAcc), 10, commonpbv4.Commitment_SINGLE)
 	assert.Equal(t, ErrAccountDoesNotExist, err)
 	assert.Nil(t, txID)
 
-	setServiceConfigResp(t, env.v4Server, true)
-	require.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil))
+	require.NoError(t, env.internal.CreateSolanaAccount(context.Background(), priv, commonpbv4.Commitment_SINGLE, nil, 0))
 
 	// Too much money
 	txID, err = env.internal.RequestAirdrop(context.Background(), kin.PublicKey(tokenAcc), MaxAirdrop+1, commonpbv4.Commitment_SINGLE)
@@ -711,34 +808,96 @@ func TestInternal_ResolveTokenAccounts(t *testing.T) {
 	env, cleanup := setup(t)
 	defer cleanup()
 
-	sender, err := kin.NewPrivateKey()
-	require.NoError(t, err)
+	sender := testutil.GenerateSolanaKeys(t, 1)[0]
+	subsidizer := testutil.GenerateSolanaKeys(t, 1)[0]
 
-	accounts, err := env.internal.ResolveTokenAccounts(context.Background(), sender.Public())
+	accounts, err := env.internal.ResolveTokenAccounts(context.Background(), kin.PublicKey(sender), true)
 	require.NoError(t, err)
 	assert.Empty(t, accounts)
 
-	tokenAccount1, err := kin.NewPrivateKey()
-	require.NoError(t, err)
-	tokenAccount2, err := kin.NewPrivateKey()
-	require.NoError(t, err)
+	tokenAccounts := testutil.GenerateSolanaKeys(t, 2)
 
 	env.v4Server.Mux.Lock()
-	env.v4Server.TokenAccounts[sender.Public().Base58()] = []*commonpbv4.SolanaAccountId{
-		{
-			Value: tokenAccount1.Public(),
-		},
-		{
-			Value: tokenAccount2.Public(),
-		},
+	for i, ta := range tokenAccounts {
+		env.v4Server.Accounts[base58.Encode(ta)] = &accountpbv4.AccountInfo{
+			AccountId: &commonpbv4.SolanaAccountId{
+				Value: ta,
+			},
+			Owner: &commonpbv4.SolanaAccountId{
+				Value: sender,
+			},
+			CloseAuthority: &commonpbv4.SolanaAccountId{
+				Value: subsidizer,
+			},
+			Balance: int64(i * 10),
+		}
+
+		senderKey := base58.Encode(sender)
+		env.v4Server.TokenAccounts[senderKey] = append(env.v4Server.TokenAccounts[senderKey], &commonpbv4.SolanaAccountId{
+			Value: ta,
+		})
 	}
+
 	env.v4Server.Mux.Unlock()
 
-	accounts, err = env.internal.ResolveTokenAccounts(context.Background(), sender.Public())
+	accounts, err = env.internal.ResolveTokenAccounts(context.Background(), kin.PublicKey(sender), false)
 	require.NoError(t, err)
-	assert.Len(t, accounts, 2)
-	assert.Equal(t, tokenAccount1.Public(), accounts[0])
-	assert.Equal(t, tokenAccount2.Public(), accounts[1])
+	assert.Equal(t, 2, len(accounts))
+
+	for i, ta := range tokenAccounts {
+		assert.EqualValues(t, ta, accounts[i].AccountId.Value)
+		assert.Zero(t, accounts[i].Balance)
+		assert.Nil(t, accounts[i].Owner)
+		assert.Nil(t, accounts[i].CloseAuthority)
+	}
+}
+
+func TestInternal_ResolveTokenAccounts_WithInfo(t *testing.T) {
+	env, cleanup := setup(t)
+	defer cleanup()
+
+	sender := testutil.GenerateSolanaKeys(t, 1)[0]
+	subsidizer := testutil.GenerateSolanaKeys(t, 1)[0]
+
+	accounts, err := env.internal.ResolveTokenAccounts(context.Background(), kin.PublicKey(sender), true)
+	require.NoError(t, err)
+	assert.Empty(t, accounts)
+
+	tokenAccounts := testutil.GenerateSolanaKeys(t, 2)
+
+	env.v4Server.Mux.Lock()
+	for i, ta := range tokenAccounts {
+		env.v4Server.Accounts[base58.Encode(ta)] = &accountpbv4.AccountInfo{
+			AccountId: &commonpbv4.SolanaAccountId{
+				Value: ta,
+			},
+			Owner: &commonpbv4.SolanaAccountId{
+				Value: sender,
+			},
+			CloseAuthority: &commonpbv4.SolanaAccountId{
+				Value: subsidizer,
+			},
+			Balance: int64(i * 10),
+		}
+
+		senderKey := base58.Encode(sender)
+		env.v4Server.TokenAccounts[senderKey] = append(env.v4Server.TokenAccounts[senderKey], &commonpbv4.SolanaAccountId{
+			Value: ta,
+		})
+	}
+
+	env.v4Server.Mux.Unlock()
+
+	accounts, err = env.internal.ResolveTokenAccounts(context.Background(), kin.PublicKey(sender), true)
+	require.NoError(t, err)
+	assert.Equal(t, 2, len(accounts))
+
+	for i, ta := range tokenAccounts {
+		assert.EqualValues(t, ta, accounts[i].AccountId.Value)
+		assert.EqualValues(t, i*10, accounts[i].Balance)
+		assert.EqualValues(t, sender, accounts[i].Owner.Value)
+		assert.EqualValues(t, subsidizer, accounts[i].CloseAuthority.Value)
+	}
 }
 
 func setServiceConfigResp(t *testing.T, server *server, includeSubsidizer bool) (token, tokenProgram, subsidizer ed25519.PublicKey) {

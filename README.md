@@ -47,10 +47,6 @@ func main() {
 }
 ```
 
-Some additional options include:
-- `WithWhitelister(key)`: The private key of an account that will be used to co-sign all transactions.
-- `WithEndpoint(endpoint)`: Specify an endpoint to use in the client. This will be inferred by default from the Environment.
-
 ### Usage
 
 #### Create an Account
@@ -63,8 +59,8 @@ err = client.CreateAccount(context.Background(), account)
 #### Get a Transaction
 The `GetTransaction` method gets transaction data by transaction hash.
 ```go
-txHash, err := hex.DecodeString("")
-transactionData, err := client.GetTransaction(context.Background(txHash))
+txHash, err := base58.Decode("")
+transactionData, err := client.GetTransaction(context.Background(), txHash)
 ```
 
 #### Get an Account Balance
@@ -96,9 +92,9 @@ A `Payment` has the following required properties:
 - `Quarks`: The amount of the payment, in [quarks](https://docs.kin.org/terms-and-concepts#quark).
 
 Additionally, it has some optional properties:
-- `Channel`: The private key of a channel account to use as the source of the transaction. If unset, `sender` will be used as the transaction source.
 - `Invoice`: An [Invoice](https://docs.kin.org/how-it-works#invoices) to associate with this payment. Cannot be set if `memo` is set.
 - `Memo` A text memo to include in the transaction. Cannot be set if `invoice` is set.
+- `WithSenderCreate()` can be provided to create a token account owned by the destination, if none exist.
 
 #### Submit an Earn Batch
 The `SubmitEarnBatch` method submits a batch of earns to Agora from a single account. It batches the earns into fewer
@@ -123,18 +119,6 @@ result, err := client.SubmitEarnBatch(context.Background(), client.EarnBatch{
     },
 })
 ```
-
-
-A single `Earn` has the following properties:
-- `Destination`: The public key of the account to which the earn will be sent.
-- `Quarks`: The amount of the earn, in [quarks](https://docs.kin.org/terms-and-concepts#quark).
-- `Invoice`: (optional) An [Invoice](https://docs.kin.org/how-it-works#invoices) to associate with this earn.
-
-The `submitEarnBatch` method has the following parameters:
-- `Sender`:  The private key of the account from which the earns will be sent.
-- `Earns`: The list of earns to send.
-- `Channel`: (optional): The private key of a channel account to use as the transaction source. If not set, `sender` will be used as the source.
-- `Memo`: (optional) A text memo to include in the transaction. Cannot be used if the earns have invoices associated with them.
 
 ### Examples
 A few examples for creating an account and different ways of submitting payments and batched earns can be found in `examples/client`.

@@ -2,12 +2,14 @@ package client
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/kinecosystem/agora-common/kin"
 	"github.com/kinecosystem/agora-common/solana"
 	"github.com/kinecosystem/agora-common/solana/memo"
-	"github.com/kinecosystem/agora-common/solana/token"
 	"github.com/kinecosystem/go/xdr"
 	"github.com/pkg/errors"
 
@@ -15,6 +17,11 @@ import (
 	commonpb "github.com/kinecosystem/agora-api/genproto/common/v3"
 	transactionpbv4 "github.com/kinecosystem/agora-api/genproto/transaction/v4"
 )
+
+type Creation struct {
+	Owner   kin.PublicKey
+	Address kin.PublicKey
+}
 
 // Payment represents a kin payment.
 type Payment struct {
@@ -38,6 +45,13 @@ type Payment struct {
 	DedupeID []byte
 }
 
+type payment struct {
+	Payment
+
+	createAccountInstructions []solana.Instruction
+	createAccountSigner       ed25519.PrivateKey
+}
+
 // ReadOnlyPayment represents a kin payment, where
 // none of the private keys are known.
 type ReadOnlyPayment struct {
@@ -50,69 +64,79 @@ type ReadOnlyPayment struct {
 	Memo    string
 }
 
-func parsePaymentsFromTransaction(tx solana.Transaction, invoiceList *commonpb.InvoiceList) ([]ReadOnlyPayment, error) {
-	transferStart := 0
+func parseTransaction(tx solana.Transaction, invoiceList *commonpb.InvoiceList) ([]Creation, []ReadOnlyPayment, error) {
+	parsed, err := kin.ParseTransaction(tx, invoiceList)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	txType := kin.TransactionTypeUnknown
-	var textMemo string
-	programIdx := tx.Message.Instructions[0].ProgramIndex
-	if bytes.Equal(tx.Message.Accounts[programIdx], memo.ProgramKey) {
-		transferStart = 1
-		memoInstr, err := memo.DecompileMemo(tx.Message, 0)
+	creations := make([]Creation, 0)
+	payments := make([]ReadOnlyPayment, 0)
+
+	var ilHash []byte
+	if invoiceList != nil {
+		raw, err := proto.Marshal(invoiceList)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to decompile memo")
+			return nil, nil, errors.Wrap(err, "failed to marshal invoice list")
 		}
 
-		m, err := kin.MemoFromBase64String(string(memoInstr.Data), false)
-		if err != nil {
-			textMemo = string(memoInstr.Data)
-		} else {
-			txType = m.TransactionType()
+		ilHash = make([]byte, 28)
+		h := sha256.Sum224(raw)
+		copy(ilHash, h[:])
+	}
+
+	for _, r := range parsed.Regions {
+		for _, c := range r.Creations {
+			if c.CreateAssoc != nil {
+				creations = append(creations, Creation{
+					Address: kin.PublicKey(c.CreateAssoc.Address),
+					Owner:   kin.PublicKey(c.CreateAssoc.Owner),
+				})
+			} else if c.Initialize != nil {
+				creation := Creation{
+					Address: kin.PublicKey(c.Initialize.Account),
+				}
+
+				if c.AccountHolder != nil {
+					creation.Owner = kin.PublicKey(c.AccountHolder.NewAuthority)
+				} else {
+					creation.Owner = kin.PublicKey(c.Initialize.Owner)
+				}
+
+				creations = append(creations, creation)
+			} else {
+				return nil, nil, errors.New("invalid solana transaction, create without instruction")
+			}
+		}
+
+		for i, p := range r.Transfers {
+			payment := ReadOnlyPayment{
+				Sender:      kin.PublicKey(p.Source),
+				Destination: kin.PublicKey(p.Destination),
+				Quarks:      int64(p.Amount),
+				Type:        kin.TransactionTypeUnknown,
+			}
+
+			if r.Memo != nil {
+				payment.Type = r.Memo.TransactionType()
+
+				fk := r.Memo.ForeignKey()
+				if bytes.Equal(fk[:28], ilHash[:]) && fk[28] == 0 {
+					if i >= len(invoiceList.Invoices) {
+						return nil, nil, errors.New("invoice list doesn't have sufficient invoices for region")
+					}
+
+					payment.Invoice = invoiceList.Invoices[i]
+				}
+			} else if len(r.MemoData) != 0 {
+				payment.Memo = string(r.MemoData)
+			}
+
+			payments = append(payments, payment)
 		}
 	}
 
-	transferCount := len(tx.Message.Instructions) - transferStart
-	if invoiceList != nil && len(invoiceList.Invoices) != transferCount {
-		return nil, errors.Errorf(
-			"provided invoice count (%d) does not match payment count (%d)",
-			len(invoiceList.Invoices),
-			transferCount,
-		)
-	}
-
-	payments := make([]ReadOnlyPayment, 0, transferCount)
-	for i := range tx.Message.Instructions[transferStart:] {
-		transferInst, err := token.DecompileTransferAccount(tx.Message, i+transferStart)
-		if err == solana.ErrIncorrectProgram || err == solana.ErrIncorrectInstruction {
-			continue
-		} else if err != nil {
-			return nil, errors.Wrap(err, "failed to decompile transfer")
-		}
-
-		p := ReadOnlyPayment{
-			Sender:      kin.PublicKey(transferInst.Source),
-			Destination: kin.PublicKey(transferInst.Destination),
-			Quarks:      int64(transferInst.Amount),
-			Type:        txType,
-		}
-
-		if invoiceList != nil {
-			// This indexing is 'safe', as agora validates on ingestion that
-			// the amount of operations in a transaction matches the amount
-			// of invoices submitted, such that there is a direct mapping
-			// between the transaction Operations and the InvoiceList.
-			//
-			// Additionally, we check they're the same above as an extra
-			// safety measure.
-			p.Invoice = invoiceList.Invoices[i]
-		} else if textMemo != "" {
-			p.Memo = textMemo
-		}
-
-		payments = append(payments, p)
-	}
-
-	return payments, nil
+	return creations, payments, nil
 }
 
 func parseHistoryItem(item *transactionpbv4.HistoryItem) ([]ReadOnlyPayment, TransactionErrors, error) {
@@ -219,7 +243,7 @@ func txStateFromProto(state transactionpbv4.GetTransactionResponse_State) Transa
 // EarnBatch is a batch of Earn payments coming from a single
 // sender/source.
 type EarnBatch struct {
-	Sender  kin.PrivateKey
+	Sender kin.PrivateKey
 
 	Memo string
 

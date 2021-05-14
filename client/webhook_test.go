@@ -15,7 +15,9 @@ import (
 	"github.com/kinecosystem/agora-common/kin"
 	"github.com/kinecosystem/agora-common/solana"
 	"github.com/kinecosystem/agora-common/solana/memo"
+	"github.com/kinecosystem/agora-common/solana/system"
 	"github.com/kinecosystem/agora-common/solana/token"
+	"github.com/kinecosystem/agora-common/webhook/createaccount"
 	"github.com/kinecosystem/agora-common/webhook/events"
 	"github.com/kinecosystem/agora-common/webhook/signtransaction"
 	"github.com/pkg/errors"
@@ -199,6 +201,252 @@ func TestEventsHandler_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
+func TestCreateAccountHandler(t *testing.T) {
+	subsidizer := testutil.GenerateSolanaKeypair(t)
+	keys := testutil.GenerateSolanaKeys(t, 3)
+
+	legacy := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		system.CreateAccount(
+			subsidizer.Public().(ed25519.PublicKey),
+			keys[1],
+			token.ProgramKey,
+			10,
+			token.AccountSize,
+		),
+		token.InitializeAccount(
+			keys[1],
+			keys[2],
+			keys[0],
+		),
+		token.SetAuthority(
+			keys[1],
+			keys[0],
+			subsidizer.Public().(ed25519.PublicKey),
+			token.AuthorityTypeCloseAccount,
+		),
+	)
+
+	create, assoc, err := token.CreateAssociatedTokenAccount(subsidizer.Public().(ed25519.PublicKey), keys[0], keys[2])
+	require.NoError(t, err)
+
+	associated := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		create,
+		token.SetAuthority(
+			assoc,
+			keys[0],
+			subsidizer.Public().(ed25519.PublicKey),
+			token.AuthorityTypeCloseAccount,
+		),
+	)
+
+	signed := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		create,
+		token.SetAuthority(
+			assoc,
+			keys[0],
+			subsidizer.Public().(ed25519.PublicKey),
+			token.AuthorityTypeCloseAccount,
+		),
+	)
+	assert.NoError(t, signed.Sign(subsidizer))
+
+	transactions := []solana.Transaction{
+		legacy,
+		associated,
+		signed,
+	}
+
+	var called bool
+	f := func(req CreateAccountRequest, resp *CreateAccountResponse) error {
+		called = true
+		assert.EqualValues(t, keys[0], req.Creation.Owner)
+		return resp.Sign(kin.PrivateKey(subsidizer))
+	}
+
+	for i, tx := range transactions {
+		body, err := json.Marshal(createaccount.Request{
+			KinVersion:        4,
+			SolanaTransaction: tx.Marshal(),
+		})
+		require.NoError(t, err)
+
+		secret := "secret"
+		b := bytes.NewBuffer(body)
+		h := hmac.New(sha256.New, []byte(secret))
+		_, _ = h.Write(b.Bytes())
+		sig := h.Sum(nil)
+
+		req, err := http.NewRequest(http.MethodPost, "/create_account", b)
+		require.NoError(t, err)
+		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
+
+		called = false
+		rr := httptest.NewRecorder()
+		handler := CreateAccountHandler(secret, f)
+		handler.ServeHTTP(rr, req)
+
+		assert.Equal(t, http.StatusOK, rr.Code, "case: %d", i)
+		assert.True(t, called)
+		called = false
+
+		var resp createaccount.SuccessResponse
+		assert.NoError(t, json.NewDecoder(rr.Result().Body).Decode(&resp))
+		assert.True(t, ed25519.Verify(subsidizer.Public().(ed25519.PublicKey), tx.Message.Marshal(), resp.Signature))
+	}
+}
+
+func TestCreateAccountHandler_Rejected(t *testing.T) {
+	subsidizer := testutil.GenerateSolanaKeypair(t)
+	keys := testutil.GenerateSolanaKeys(t, 3)
+
+	create, assoc, err := token.CreateAssociatedTokenAccount(subsidizer.Public().(ed25519.PublicKey), keys[0], keys[2])
+	require.NoError(t, err)
+
+	tx := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		create,
+		token.SetAuthority(
+			assoc,
+			keys[0],
+			subsidizer.Public().(ed25519.PublicKey),
+			token.AuthorityTypeCloseAccount,
+		),
+	)
+
+	var called bool
+	f := func(req CreateAccountRequest, resp *CreateAccountResponse) error {
+		called = true
+		resp.Reject()
+		return nil
+	}
+
+	req := createaccount.Request{
+		KinVersion:        4,
+		SolanaTransaction: tx.Marshal(),
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	secret := "secret"
+	b := bytes.NewBuffer(body)
+	h := hmac.New(sha256.New, []byte(secret))
+	_, _ = h.Write(b.Bytes())
+	sig := h.Sum(nil)
+
+	httpReq, err := http.NewRequest(http.MethodPost, "/create_account", b)
+	require.NoError(t, err)
+	httpReq.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
+
+	called = false
+	rr := httptest.NewRecorder()
+	handler := CreateAccountHandler(secret, f)
+	handler.ServeHTTP(rr, httpReq)
+
+	assert.Equal(t, http.StatusForbidden, rr.Code)
+	assert.True(t, called)
+}
+
+func TestCreateAccountHandler_Invalid(t *testing.T) {
+	subsidizer := testutil.GenerateSolanaKeypair(t)
+	keys := testutil.GenerateSolanaKeys(t, 3)
+
+	var instructions []solana.Instruction
+	for i := 0; i < 2; i++ {
+		create, assoc, err := token.CreateAssociatedTokenAccount(
+			subsidizer.Public().(ed25519.PublicKey),
+			keys[0],
+			keys[2],
+		)
+		require.NoError(t, err)
+
+		instructions = append(instructions,
+			create,
+			token.SetAuthority(
+				assoc,
+				keys[0],
+				subsidizer.Public().(ed25519.PublicKey),
+				token.AuthorityTypeCloseAccount,
+			),
+		)
+	}
+	multileCreates := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		instructions...,
+	)
+
+	create, assoc, err := token.CreateAssociatedTokenAccount(
+		subsidizer.Public().(ed25519.PublicKey),
+		keys[0],
+		keys[2],
+	)
+	require.NoError(t, err)
+
+	createWithTransfer := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		create,
+		token.SetAuthority(
+			assoc,
+			keys[0],
+			subsidizer.Public().(ed25519.PublicKey),
+			token.AuthorityTypeCloseAccount,
+		),
+		token.Transfer(
+			keys[0],
+			keys[1],
+			keys[0],
+			10,
+		),
+	)
+
+	missingAuth := solana.NewTransaction(
+		subsidizer.Public().(ed25519.PublicKey),
+		create,
+	)
+
+	transactions := []solana.Transaction{
+		multileCreates,
+		createWithTransfer,
+		missingAuth,
+	}
+
+	var called bool
+	f := func(req CreateAccountRequest, resp *CreateAccountResponse) error {
+		called = true
+		assert.EqualValues(t, keys[0], req.Creation.Owner)
+		return resp.Sign(kin.PrivateKey(subsidizer))
+	}
+
+	for i, tx := range transactions {
+		body, err := json.Marshal(createaccount.Request{
+			KinVersion:        4,
+			SolanaTransaction: tx.Marshal(),
+		})
+		require.NoError(t, err)
+
+		secret := "secret"
+		b := bytes.NewBuffer(body)
+		h := hmac.New(sha256.New, []byte(secret))
+		_, _ = h.Write(b.Bytes())
+		sig := h.Sum(nil)
+
+		req, err := http.NewRequest(http.MethodPost, "/create_account", b)
+		require.NoError(t, err)
+		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
+
+		called = false
+		rr := httptest.NewRecorder()
+		handler := CreateAccountHandler(secret, f)
+		handler.ServeHTTP(rr, req)
+
+		assert.Equal(t, http.StatusBadRequest, rr.Code, "case: %d", i)
+		assert.False(t, called)
+		called = false
+	}
+}
+
 func TestSignTransactionHandler(t *testing.T) {
 	whitelist, err := kin.NewPrivateKey()
 	require.NoError(t, err)
@@ -223,7 +471,7 @@ func TestSignTransactionHandler(t *testing.T) {
 				assert.Equal(t, kin.TransactionTypeSpend, p.Type)
 				invoiceCount++
 			} else {
-				assert.Len(t, req.SolanaTransaction.Message.Instructions, 10)
+				assert.Equal(t, 10, len(req.SolanaTransaction.Message.Instructions))
 				assert.Equal(t, kin.TransactionTypeUnknown, p.Type)
 			}
 		}
@@ -248,7 +496,7 @@ func TestSignTransactionHandler(t *testing.T) {
 		genRequest(t, false, true, 4),
 		genRequest(t, true, false, 4),
 	}
-	for _, data := range signRequests {
+	for i, data := range signRequests {
 		body, err := json.Marshal(data)
 		require.NoError(t, err)
 
@@ -266,7 +514,7 @@ func TestSignTransactionHandler(t *testing.T) {
 		handler := SignTransactionHandler(EnvironmentTest, secret, f)
 		handler.ServeHTTP(rr, req)
 
-		assert.Equal(t, http.StatusOK, rr.Code)
+		assert.Equal(t, http.StatusOK, rr.Code, "case: %d", i)
 		assert.True(t, called)
 		called = false
 
@@ -515,6 +763,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 }
 
 func genRequest(t *testing.T, useInvoice, useMemo bool, version int) signtransaction.Request {
+	subsidizer := testutil.GenerateSolanaKeys(t, 1)[0]
 	accounts := make([]ed25519.PrivateKey, 10)
 	for i := 0; i < 10; i++ {
 		accounts[i] = testutil.GenerateSolanaKeypair(t)
@@ -522,11 +771,15 @@ func genRequest(t *testing.T, useInvoice, useMemo bool, version int) signtransac
 
 	var transfers []solana.Instruction
 	for i := 0; i < 10; i++ {
-		transfers = append(transfers, token.Transfer(
-			accounts[0].Public().(ed25519.PublicKey),
-			accounts[i].Public().(ed25519.PublicKey),
-			accounts[0].Public().(ed25519.PublicKey),
-			1))
+		transfers = append(
+			transfers,
+			token.Transfer(
+				accounts[0].Public().(ed25519.PublicKey),
+				accounts[i].Public().(ed25519.PublicKey),
+				accounts[0].Public().(ed25519.PublicKey),
+				1,
+			),
+		)
 	}
 
 	req := signtransaction.Request{
@@ -566,7 +819,7 @@ func genRequest(t *testing.T, useInvoice, useMemo bool, version int) signtransac
 	instructions = append(instructions, transfers...)
 
 	var err error
-	req.SolanaTransaction = solana.NewTransaction(accounts[0].Public().(ed25519.PublicKey), instructions...).Marshal()
+	req.SolanaTransaction = solana.NewTransaction(subsidizer, instructions...).Marshal()
 	req.KinVersion = version
 	require.NoError(t, err)
 	return req

@@ -9,9 +9,8 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/kinecosystem/agora-api/genproto/airdrop/v4"
+	"github.com/kinecosystem/agora-common/kin"
 	"github.com/kinecosystem/agora-common/solana"
-	"github.com/kinecosystem/agora-common/solana/system"
-	"github.com/kinecosystem/agora-common/solana/token"
 	"github.com/mr-tron/base58"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -40,7 +39,9 @@ type server struct {
 	Subsidizer        ed25519.PrivateKey
 
 	Gets            map[string]transactionpbv4.GetTransactionResponse
+	Signs           []*transactionpbv4.SignTransactionRequest
 	Submits         []*transactionpbv4.SubmitTransactionRequest
+	SignResponses   []*transactionpbv4.SignTransactionResponse
 	SubmitResponses []*transactionpbv4.SubmitTransactionResponse
 
 	EventsResponses []*accountpbv4.Events
@@ -72,19 +73,38 @@ func (t *server) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccou
 	}
 
 	t.Creates = append(t.Creates, proto.Clone(req).(*accountpbv4.CreateAccountRequest))
-
-	sysCreate, err := system.DecompileCreateAccount(tx.Message, 0)
+	parsed, err := kin.ParseTransaction(tx, nil)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid Sys::CreateAccount instruction")
+		return nil, status.Error(codes.InvalidArgument, "invalid transaction")
+	}
+	if len(parsed.Regions) > 2 {
+		return nil, status.Error(codes.InvalidArgument, "too many regions")
 	}
 
-	tokenInit, err := token.DecompileInitializeAccount(tx.Message, 1)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "invalid Token::InitializeAccount instruction")
-	}
+	var tokenAccID, ownerID string
+	var tokenAddr ed25519.PublicKey
+	for _, r := range parsed.Regions {
+		switch len(r.Creations) {
+		case 0:
+			continue
+		case 1:
+			if tokenAccID != "" {
+				return nil, status.Error(codes.InvalidArgument, "too many account creations")
+			}
+		default:
+			return nil, status.Error(codes.InvalidArgument, "too many account creations")
+		}
 
-	tokenAccID := base58.Encode(sysCreate.Address)
-	ownerID := base58.Encode(tokenInit.Owner)
+		if r.Creations[0].Create != nil {
+			tokenAddr = r.Creations[0].Create.Address
+			tokenAccID = base58.Encode(tokenAddr)
+			ownerID = base58.Encode(r.Creations[0].AccountHolder.NewAuthority)
+		} else {
+			tokenAddr = r.Creations[0].CreateAssoc.Address
+			tokenAccID = base58.Encode(tokenAddr)
+			ownerID = base58.Encode(r.Creations[0].CreateAssoc.Owner)
+		}
+	}
 
 	if info, ok := t.Accounts[tokenAccID]; ok {
 		return &accountpbv4.CreateAccountResponse{
@@ -94,11 +114,11 @@ func (t *server) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccou
 	}
 
 	accountInfo := &accountpbv4.AccountInfo{
-		AccountId: &commonpbv4.SolanaAccountId{Value: sysCreate.Address},
+		AccountId: &commonpbv4.SolanaAccountId{Value: tokenAddr},
 		Balance:   10,
 	}
 	t.Accounts[tokenAccID] = accountInfo
-	t.TokenAccounts[ownerID] = append(t.TokenAccounts[ownerID], &commonpbv4.SolanaAccountId{Value: sysCreate.Address})
+	t.TokenAccounts[ownerID] = append(t.TokenAccounts[ownerID], &commonpbv4.SolanaAccountId{Value: tokenAddr})
 
 	return &accountpbv4.CreateAccountResponse{
 		AccountInfo: accountInfo,
@@ -140,13 +160,30 @@ func (t *server) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.Reso
 		return &accountpbv4.ResolveTokenAccountsResponse{}, nil
 	}
 
-	tokenAccounts := make([]*commonpbv4.SolanaAccountId, len(accounts))
-	for i, a := range accounts {
-		tokenAccounts[i] = proto.Clone(a).(*commonpbv4.SolanaAccountId)
+	resp := &accountpbv4.ResolveTokenAccountsResponse{
+		TokenAccounts:     make([]*commonpbv4.SolanaAccountId, len(accounts)),
+		TokenAccountInfos: make([]*accountpbv4.AccountInfo, len(accounts)),
 	}
-	return &accountpbv4.ResolveTokenAccountsResponse{
-		TokenAccounts: tokenAccounts,
-	}, nil
+
+	for i, a := range accounts {
+		resp.TokenAccounts[i] = proto.Clone(a).(*commonpbv4.SolanaAccountId)
+
+		if req.IncludeAccountInfo {
+			info, ok := t.Accounts[base58.Encode(a.Value)]
+			if !ok {
+				return nil, status.Error(codes.Internal, "account info not found")
+			}
+
+			resp.TokenAccountInfos[i] = proto.Clone(info).(*accountpbv4.AccountInfo)
+		} else {
+			resp.TokenAccountInfos[i] = &accountpbv4.AccountInfo{
+				AccountId: proto.Clone(a).(*commonpbv4.SolanaAccountId),
+			}
+		}
+
+	}
+
+	return resp, nil
 }
 
 func (t *server) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4.Account_GetEventsServer) error {
@@ -211,6 +248,49 @@ func (t *server) GetMinimumBalanceForRentExemption(ctx context.Context, req *tra
 
 func (t *server) GetHistory(context.Context, *transactionpbv4.GetHistoryRequest) (*transactionpbv4.GetHistoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func (t *server) SignTransaction(ctx context.Context, req *transactionpbv4.SignTransactionRequest) (*transactionpbv4.SignTransactionResponse, error) {
+	t.Mux.Lock()
+	defer t.Mux.Unlock()
+
+	if err := validateV4Headers(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := t.GetError(); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	tx := solana.Transaction{}
+	if err := tx.Unmarshal(req.Transaction.Value); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to unmarshal tx: %v", err)
+	}
+
+	t.Signs = append(t.Signs, proto.Clone(req).(*transactionpbv4.SignTransactionRequest))
+	if len(t.SignResponses) > 0 {
+		r := t.SignResponses[0]
+		t.SignResponses = t.SignResponses[1:]
+		if r != nil {
+			r.Signature = &commonpbv4.TransactionSignature{
+				Value: tx.Signature(),
+			}
+			return r, nil
+		}
+	}
+
+	if t.ServiceConfig != nil && t.ServiceConfig.GetSubsidizerAccount() != nil && t.Subsidizer != nil && bytes.Equal(tx.Signatures[0][:], make([]byte, ed25519.SignatureSize)) {
+		err := tx.Sign(t.Subsidizer)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to sign transaction with subsidizer")
+		}
+	}
+
+	return &transactionpbv4.SignTransactionResponse{
+		Signature: &commonpbv4.TransactionSignature{
+			Value: tx.Signature(),
+		},
+	}, nil
 }
 
 func (t *server) SubmitTransaction(ctx context.Context, req *transactionpbv4.SubmitTransactionRequest) (*transactionpbv4.SubmitTransactionResponse, error) {

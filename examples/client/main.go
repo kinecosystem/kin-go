@@ -32,17 +32,13 @@ func main() {
 	}
 
 	// Initialize the SDK using AppIndex 2, the test app.
-	c, err := client.New(client.EnvironmentTest, client.WithAppIndex(2))
+	c, err := client.New(client.EnvironmentTest, client.WithAppIndex(1), client.WithMaxRetries(0))
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Create a new account
-	priv, err := kin.NewPrivateKey()
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = c.CreateAccount(context.Background(), kin.PrivateKey(priv))
+	err = c.CreateAccount(context.Background(), sender)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -53,7 +49,7 @@ func main() {
 		Destination: dest,
 		Type:        kin.TransactionTypeP2P,
 		Quarks:      kin.MustToQuarks("1"),
-	})
+	}, client.WithAccountResolution(client.AccountResolutionPreferred))
 	fmt.Printf("Hash: %x, err: %v\n", txHash, err)
 
 	// Payment with an old style memo

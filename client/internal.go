@@ -3,9 +3,11 @@ package client
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,8 +15,9 @@ import (
 	"github.com/kinecosystem/agora-common/kin/version"
 	"github.com/kinecosystem/agora-common/retry"
 	"github.com/kinecosystem/agora-common/solana"
-	"github.com/kinecosystem/agora-common/solana/system"
+	"github.com/kinecosystem/agora-common/solana/memo"
 	"github.com/kinecosystem/agora-common/solana/token"
+	"github.com/mr-tron/base58"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -83,13 +86,39 @@ func (c *InternalClient) GetBlockchainVersion(ctx context.Context) (version.KinV
 	return kinVersion, nil
 }
 
+type SignTransactionResult struct {
+	ID            []byte
+	InvoiceErrors []*commonpb.InvoiceError
+}
+
 type SubmitTransactionResult struct {
 	ID            []byte
 	Errors        TransactionErrors
 	InvoiceErrors []*commonpb.InvoiceError
 }
 
-func (c *InternalClient) CreateSolanaAccount(ctx context.Context, key kin.PrivateKey, commitment commonpbv4.Commitment, subsidizer kin.PrivateKey) (err error) {
+func (s SubmitTransactionResult) String() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("ID: %s\n", base58.Encode(s.ID)))
+	sb.WriteString("Errors:\n")
+	sb.WriteString(fmt.Sprintf("\tTxError: %v\n", s.Errors.TxError))
+	sb.WriteString("\tOpErrors:\n")
+	for i, o := range s.Errors.OpErrors {
+		sb.WriteString(fmt.Sprintf("\t\t%d: %v\n", i, o))
+	}
+	sb.WriteString("\tPaymentErrors:\n")
+	for i, o := range s.Errors.PaymentErrors {
+		sb.WriteString(fmt.Sprintf("\t\t%d: %v\n", i, o))
+	}
+	sb.WriteString("\tInvoiceErrors:\n")
+	for i, o := range s.InvoiceErrors {
+		sb.WriteString(fmt.Sprintf("\t\t%d: %v\n", i, o))
+	}
+
+	return sb.String()
+}
+
+func (c *InternalClient) CreateSolanaAccount(ctx context.Context, key kin.PrivateKey, commitment commonpbv4.Commitment, subsidizer kin.PrivateKey, appIndex uint16) (err error) {
 	ctx = c.addMetadataToCtx(ctx)
 
 	config, err := c.GetServiceConfig(ctx)
@@ -102,37 +131,57 @@ func (c *InternalClient) CreateSolanaAccount(ctx context.Context, key kin.Privat
 	}
 
 	owner := ed25519.PublicKey(key.Public())
-	tokenAcc, tokenAccKey := generateTokenAccount(ed25519.PrivateKey(key))
-	tokenProgram := config.TokenProgram.Value
 
 	var subsidizerID ed25519.PublicKey
-	if subsidizer != nil {
+	if len(subsidizer) != 0 {
 		subsidizerID = ed25519.PublicKey(subsidizer.Public())
 	} else {
 		subsidizerID = config.SubsidizerAccount.Value
 	}
 
+	var instructions []solana.Instruction
+	if appIndex > 0 {
+		m, err := kin.NewMemo(1, kin.TransactionTypeNone, appIndex, nil)
+		if err != nil {
+			return errors.Wrap(err, "failed to create memo")
+		}
+
+		instructions = append(instructions, memo.Instruction(base64.StdEncoding.EncodeToString(m[:])))
+	}
+
+	createInstruction, addr, err := token.CreateAssociatedTokenAccount(
+		subsidizerID,
+		owner,
+		config.Token.Value,
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to generate associated token account instruction")
+	}
+
+	instructions = append(instructions, createInstruction)
+	instructions = append(instructions, token.SetAuthority(
+		addr,
+		owner,
+		subsidizerID,
+		token.AuthorityTypeCloseAccount,
+	))
+
+	tx := solana.NewTransaction(
+		subsidizerID,
+		instructions...,
+	)
+
 	recentBlockhash, err := c.GetRecentBlockhash(ctx)
 	if err != nil {
 		return err
 	}
-	minBalance, err := c.GetMinimumBalanceForRentException(ctx, token.AccountSize)
-	if err != nil {
-		return err
-	}
-
-	tx := solana.NewTransaction(subsidizerID,
-		system.CreateAccount(subsidizerID, tokenAcc, tokenProgram, minBalance, token.AccountSize),
-		token.InitializeAccount(tokenAcc, config.Token.Value, owner),
-		token.SetAuthority(tokenAcc, owner, subsidizerID, token.AuthorityTypeCloseAccount),
-	)
 	tx.SetBlockhash(recentBlockhash)
 
 	var signers []ed25519.PrivateKey
 	if subsidizer != nil {
-		signers = []ed25519.PrivateKey{ed25519.PrivateKey(subsidizer), ed25519.PrivateKey(key), tokenAccKey}
+		signers = []ed25519.PrivateKey{ed25519.PrivateKey(subsidizer), ed25519.PrivateKey(key)}
 	} else {
-		signers = []ed25519.PrivateKey{ed25519.PrivateKey(key), tokenAccKey}
+		signers = []ed25519.PrivateKey{ed25519.PrivateKey(key)}
 	}
 	err = tx.Sign(signers...)
 	if err != nil {
@@ -239,14 +288,15 @@ func (c *InternalClient) GetEvents(ctx context.Context, account kin.PublicKey) (
 	return ch, err
 }
 
-func (c *InternalClient) ResolveTokenAccounts(ctx context.Context, publicKey kin.PublicKey) (accounts []kin.PublicKey, err error) {
+func (c *InternalClient) ResolveTokenAccounts(ctx context.Context, publicKey kin.PublicKey, includeAccountInfo bool) (accounts []*accountpbv4.AccountInfo, err error) {
 	ctx = c.addMetadataToCtx(ctx)
 
 	var resp *accountpbv4.ResolveTokenAccountsResponse
 
 	_, err = c.retrier.Retry(func() error {
 		resp, err = c.accountClientV4.ResolveTokenAccounts(ctx, &accountpbv4.ResolveTokenAccountsRequest{
-			AccountId: &commonpbv4.SolanaAccountId{Value: publicKey},
+			AccountId:          &commonpbv4.SolanaAccountId{Value: publicKey},
+			IncludeAccountInfo: includeAccountInfo,
 		})
 		return err
 	})
@@ -254,11 +304,22 @@ func (c *InternalClient) ResolveTokenAccounts(ctx context.Context, publicKey kin
 		return accounts, errors.Wrap(err, "failed to resolve token accounts")
 	}
 
-	accounts = make([]kin.PublicKey, len(resp.TokenAccounts))
-	for i, tokenAccount := range resp.TokenAccounts {
-		accounts[i] = tokenAccount.Value
+	// This is currently in place for backward compat with the server.
+	if len(resp.TokenAccountInfos) != len(resp.TokenAccounts) {
+		// If we aren't requesting account info, we can interpolate the results ourselves.
+		if !includeAccountInfo {
+			resp.TokenAccountInfos = make([]*accountpbv4.AccountInfo, len(resp.TokenAccounts))
+			for i := 0; i < len(resp.TokenAccounts); i++ {
+				resp.TokenAccountInfos[i] = &accountpbv4.AccountInfo{
+					AccountId: resp.TokenAccounts[i],
+				}
+			}
+		} else {
+			return nil, errors.New("server does not support resolving with account info")
+		}
 	}
-	return accounts, nil
+
+	return resp.TokenAccountInfos, nil
 }
 
 func (c *InternalClient) GetTransaction(ctx context.Context, txID []byte, commitment commonpbv4.Commitment) (data TransactionData, err error) {
@@ -291,7 +352,40 @@ func (c *InternalClient) GetTransaction(ctx context.Context, txID []byte, commit
 	return data, nil
 }
 
-func (c *InternalClient) SubmitSolanaTransaction(ctx context.Context, tx solana.Transaction, il *commonpb.InvoiceList, commitment commonpbv4.Commitment, dedupeId []byte) (result SubmitTransactionResult, err error) {
+func (c *InternalClient) SignTransaction(ctx context.Context, tx solana.Transaction, il *commonpb.InvoiceList) (result SignTransactionResult, err error) {
+	ctx = c.addMetadataToCtx(ctx)
+
+	var resp *transactionpbv4.SignTransactionResponse
+	_, err = c.retrier.Retry(func() error {
+		resp, err = c.transactionClientV4.SignTransaction(ctx, &transactionpbv4.SignTransactionRequest{
+			Transaction: &commonpbv4.Transaction{Value: tx.Marshal()},
+			InvoiceList: il,
+		})
+
+		return err
+	})
+	if err != nil {
+		return result, err
+	}
+
+	if len(resp.Signature.GetValue()) == ed25519.SignatureSize {
+		result.ID = resp.Signature.Value
+	}
+
+	switch resp.Result {
+	case transactionpbv4.SignTransactionResponse_OK:
+	case transactionpbv4.SignTransactionResponse_REJECTED:
+		return result, ErrTransactionRejected
+	case transactionpbv4.SignTransactionResponse_INVOICE_ERROR:
+		result.InvoiceErrors = resp.InvoiceErrors
+	default:
+		return result, errors.Errorf("unexpected result from agora: %v", resp.Result)
+	}
+
+	return result, nil
+}
+
+func (c *InternalClient) SubmitSolanaTransaction(ctx context.Context, tx solana.Transaction, il *commonpb.InvoiceList, commitment commonpbv4.Commitment, dedupeID []byte) (result SubmitTransactionResult, err error) {
 	ctx = c.addMetadataToCtx(ctx)
 
 	attempt := 0
@@ -305,7 +399,7 @@ func (c *InternalClient) SubmitSolanaTransaction(ctx context.Context, tx solana.
 			Transaction: &commonpbv4.Transaction{Value: tx.Marshal()},
 			InvoiceList: il,
 			Commitment:  commitment,
-			DedupeId:    dedupeId,
+			DedupeId:    dedupeID,
 		})
 		if err != nil {
 			return errors.Wrap(err, "failed to submit transaction")
@@ -437,5 +531,9 @@ func (c *InternalClient) RequestAirdrop(ctx context.Context, publicKey kin.Publi
 }
 
 func (c *InternalClient) addMetadataToCtx(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, userAgentHeader, userAgent, version.KinVersionHeader, strconv.Itoa(int(version.KinVersion4)))
+	return metadata.AppendToOutgoingContext(
+		ctx,
+		userAgentHeader, userAgent,
+		version.KinVersionHeader, strconv.Itoa(int(version.KinVersion4)),
+	)
 }
