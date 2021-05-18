@@ -6,7 +6,7 @@ require (
 	github.com/golang/protobuf v1.5.0
 	github.com/google/uuid v1.1.2
 	github.com/kinecosystem/agora-api v0.26.0
-	github.com/kinecosystem/agora-common v0.77.0
+	github.com/kinecosystem/agora-common v0.80.0
 	github.com/kinecosystem/go v0.0.0-20191108204735-d6832148266e
 	github.com/mattn/go-colorable v0.1.6 // indirect
 	github.com/mr-tron/base58 v1.2.0
