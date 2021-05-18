@@ -13,6 +13,10 @@ import (
 
 var whitelistKey kin.PrivateKey
 
+func createHandler(req client.CreateAccountRequest, resp *client.CreateAccountResponse) error {
+	return resp.Sign(whitelistKey)
+}
+
 // signHandler blindly whitelists every transaction that's directed to it.
 //
 // The handler rejects any transaction where a sender is the same as the
@@ -55,6 +59,7 @@ func main() {
 		log.Fatalf("unknown environment: %s", env)
 	}
 
+	http.HandleFunc("/create_account", client.CreateAccountHandler(webhookSecret, createHandler))
 	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(env, webhookSecret, signHandler))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

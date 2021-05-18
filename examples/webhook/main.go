@@ -28,6 +28,11 @@ func eventsHandler(events []events.Event) error {
 	return nil
 }
 
+// createAccountHandler allows us to sign or reject creations related to our app.
+func createAccountHandler(req client.CreateAccountRequest, resp *client.CreateAccountResponse) error {
+	return resp.Sign(whitelistKey)
+}
+
 // signHandler allows us to sign or reject transactions related to our app.
 // (as configured by the AppIndex, or legacy memo field).
 func signHandler(req client.SignTransactionRequest, resp *client.SignTransactionResponse) error {
@@ -107,6 +112,7 @@ func main() {
 	}
 
 	http.HandleFunc("/events", client.EventsHandler(webhookSecret, eventsHandler))
+	http.HandleFunc("/create_account", client.CreateAccountHandler(webhookSecret, createAccountHandler))
 	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(env, webhookSecret, signHandler))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
