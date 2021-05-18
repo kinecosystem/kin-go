@@ -32,6 +32,7 @@ import (
 const (
 	SDKVersion      = "0.6.0"
 	userAgentHeader = "kin-user-agent"
+	appIndexHeader  = "app-index"
 )
 
 var (
@@ -45,7 +46,8 @@ var (
 // the gRPC client directly). However, there are no stability guarantees between
 // releases, or during a migration event.
 type InternalClient struct {
-	retrier retry.Retrier
+	retrier  retry.Retrier
+	appIndex uint16
 
 	accountClientV4     accountpbv4.AccountClient
 	transactionClientV4 transactionpbv4.TransactionClient
@@ -56,12 +58,13 @@ type InternalClient struct {
 	configLastFetched time.Time
 }
 
-func NewInternalClient(cc *grpc.ClientConn, retrier retry.Retrier) *InternalClient {
+func NewInternalClient(cc *grpc.ClientConn, retrier retry.Retrier, appIndex uint16) *InternalClient {
 	return &InternalClient{
 		retrier:             retrier,
 		accountClientV4:     accountpbv4.NewAccountClient(cc),
 		transactionClientV4: transactionpbv4.NewTransactionClient(cc),
 		airdropClientV4:     airdroppbv4.NewAirdropClient(cc),
+		appIndex:            appIndex,
 	}
 }
 
@@ -531,6 +534,15 @@ func (c *InternalClient) RequestAirdrop(ctx context.Context, publicKey kin.Publi
 }
 
 func (c *InternalClient) addMetadataToCtx(ctx context.Context) context.Context {
+	if c.appIndex > 0 {
+		return metadata.AppendToOutgoingContext(
+			ctx,
+			userAgentHeader, userAgent,
+			version.KinVersionHeader, strconv.Itoa(int(version.KinVersion4)),
+			appIndexHeader, strconv.Itoa(int(c.appIndex)),
+		)
+	}
+
 	return metadata.AppendToOutgoingContext(
 		ctx,
 		userAgentHeader, userAgent,

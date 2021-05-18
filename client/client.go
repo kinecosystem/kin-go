@@ -261,7 +261,7 @@ func New(env Environment, opts ...ClientOption) (Client, error) {
 		retry.NonRetriableGRPCCodes(codes.Canceled),
 	)
 
-	c.internal = NewInternalClient(c.opts.cc, retrier)
+	c.internal = NewInternalClient(c.opts.cc, retrier, c.opts.appIndex)
 
 	return c, nil
 }
