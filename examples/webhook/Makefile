@@ -4,7 +4,7 @@ GO_ARCH := $(shell go env GOARCH)
 .PHONY: build
 build:
 	GOOS=$(GO_OS) GOARCH=$(GO_ARCH) CGO_ENABLED=0 go build $(GO_FLAGS) -o build/$(GO_OS)-$(GO_ARCH)/main \
-		github.com/kinecosystem/agora-common/examples/server
+		github.com/kinecosystem/kin-go/examples/server
 
 .PHONY: image
 image: GO_OS := linux
