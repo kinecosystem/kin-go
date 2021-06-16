@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	SDKVersion      = "0.7.0"
+	SDKVersion      = "0.8.0"
 	userAgentHeader = "kin-user-agent"
 	appIndexHeader  = "app-index"
 )
