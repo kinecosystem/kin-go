@@ -511,7 +511,7 @@ func TestSignTransactionHandler(t *testing.T) {
 		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
 
 		rr := httptest.NewRecorder()
-		handler := SignTransactionHandler(EnvironmentTest, secret, f)
+		handler := SignTransactionHandler(secret, f)
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusOK, rr.Code, "case: %d", i)
@@ -533,7 +533,7 @@ func TestSignTransactionHandler(t *testing.T) {
 	req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString([]byte("fake sig")))
 
 	rr := httptest.NewRecorder()
-	handler := SignTransactionHandler(EnvironmentTest, "", f)
+	handler := SignTransactionHandler("", f)
 	handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
@@ -566,7 +566,7 @@ func TestSignTransactionHandler_Rejected(t *testing.T) {
 		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
 
 		rr := httptest.NewRecorder()
-		handler := SignTransactionHandler(EnvironmentTest, secret, f)
+		handler := SignTransactionHandler(secret, f)
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusForbidden, rr.Code)
@@ -610,7 +610,7 @@ func TestSignTransactionHandler_InvoiceErrors(t *testing.T) {
 		req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
 
 		rr := httptest.NewRecorder()
-		handler := SignTransactionHandler(EnvironmentTest, secret, f)
+		handler := SignTransactionHandler(secret, f)
 		handler.ServeHTTP(rr, req)
 
 		assert.Equal(t, http.StatusForbidden, rr.Code)
@@ -653,7 +653,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	}
 	for _, r := range invalidMethodRequest {
 		rr := httptest.NewRecorder()
-		handler := SignTransactionHandler(EnvironmentTest, "secret", f)
+		handler := SignTransactionHandler("secret", f)
 		handler.ServeHTTP(rr, r)
 
 		assert.Equal(t, http.StatusMethodNotAllowed, rr.Code)
@@ -671,7 +671,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString(sig[:]))
 
 	rr := httptest.NewRecorder()
-	handler := SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler := SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
@@ -682,7 +682,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	req.Header.Add(AgoraHMACHeader, base64.StdEncoding.EncodeToString([]byte("fake sig")))
 
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rr.Code)
@@ -692,7 +692,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	require.NoError(t, err)
 
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rr.Code)
@@ -715,7 +715,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	// Invalid version
 	signReq := genRequest(t, false, false, 1)
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "", f)
+	handler = SignTransactionHandler("", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
@@ -730,7 +730,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	signReq.InvoiceList = ilBytes
 
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
@@ -740,7 +740,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	signReq.SolanaTransaction = []byte("somebytes")
 
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
@@ -748,7 +748,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	signReq = genRequest(t, true, false, 4)
 	signReq.InvoiceList = signReq.InvoiceList[1:]
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 
@@ -757,7 +757,7 @@ func TestSignTransactionHandler_Invalid(t *testing.T) {
 	signReq.SolanaTransaction = nil
 
 	rr = httptest.NewRecorder()
-	handler = SignTransactionHandler(EnvironmentTest, "secret", f)
+	handler = SignTransactionHandler("secret", f)
 	handler.ServeHTTP(rr, makeReq(signReq))
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }

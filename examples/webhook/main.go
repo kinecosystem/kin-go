@@ -113,6 +113,6 @@ func main() {
 
 	http.HandleFunc("/events", client.EventsHandler(webhookSecret, eventsHandler))
 	http.HandleFunc("/create_account", client.CreateAccountHandler(webhookSecret, createAccountHandler))
-	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(env, webhookSecret, signHandler))
+	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(webhookSecret, signHandler))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

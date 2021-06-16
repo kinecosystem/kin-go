@@ -307,7 +307,7 @@ func (r *SignTransactionResponse) MarkSKUNotFound(idx int) {
 
 // SignTransactionHandler returns an http.HandlerFunc that decodes and verifies
 // a signtransaction webhook call, before forwarding it to the specified SignTransactionFunc.
-func SignTransactionHandler(env Environment, secret string, f SignTransactionFunc) http.HandlerFunc {
+func SignTransactionHandler(secret string, f SignTransactionFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			// todo(consistency): double check error code response

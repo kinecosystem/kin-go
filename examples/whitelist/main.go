@@ -52,14 +52,7 @@ func main() {
 		log.Fatal("invalid whitelist seed")
 	}
 
-	env := client.Environment(os.Getenv("ENVIRONMENT"))
-	switch env {
-	case client.EnvironmentTest, client.EnvironmentProd:
-	default:
-		log.Fatalf("unknown environment: %s", env)
-	}
-
 	http.HandleFunc("/create_account", client.CreateAccountHandler(webhookSecret, createHandler))
-	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(env, webhookSecret, signHandler))
+	http.HandleFunc("/sign_transaction", client.SignTransactionHandler(webhookSecret, signHandler))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

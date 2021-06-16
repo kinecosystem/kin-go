@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.8.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.7.0)
+- Remove the `env` parameter from `SignTransactionHandler`, as it's no longer used.
+
 ## [v0.7.0](http://github.com/kinecosystem/kin-go/releases/tag/v0.6.0)
 - Remove Stellar (Kin 2 & Kin 3) support
     - Only Kin 4 and v4 Agora APIs are supported
