@@ -37,7 +37,7 @@ import (
 )
 
 type testEnv struct {
-	v4Server *server
+	v4Server *TestServer
 	conn     *grpc.ClientConn
 	internal *InternalClient
 	client   *client
@@ -45,7 +45,7 @@ type testEnv struct {
 
 func setup(t *testing.T, opts ...ClientOption) (*testEnv, func()) {
 	env := &testEnv{
-		v4Server: newServer(),
+		v4Server: NewTestServer(),
 	}
 
 	conn, serv, err := agoratestutil.NewServer(
@@ -900,7 +900,7 @@ func TestInternal_ResolveTokenAccounts_WithInfo(t *testing.T) {
 	}
 }
 
-func setServiceConfigResp(t *testing.T, server *server, includeSubsidizer bool) (token, tokenProgram, subsidizer ed25519.PublicKey) {
+func setServiceConfigResp(t *testing.T, server *TestServer, includeSubsidizer bool) (token, tokenProgram, subsidizer ed25519.PublicKey) {
 	var err error
 	token, _, err = ed25519.GenerateKey(nil)
 	require.NoError(t, err)

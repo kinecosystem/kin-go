@@ -26,7 +26,7 @@ var RecentBlockhash = bytes.Repeat([]byte{1}, 32)
 var MinBalanceForRentException = uint64(1234567)
 var MaxAirdrop = uint64(100000)
 
-type server struct {
+type TestServer struct {
 	Mux    sync.Mutex
 	Errors []error
 
@@ -47,15 +47,15 @@ type server struct {
 	EventsResponses []*accountpbv4.Events
 }
 
-func newServer() *server {
-	return &server{
+func NewTestServer() *TestServer {
+	return &TestServer{
 		Accounts:      make(map[string]*accountpbv4.AccountInfo),
 		TokenAccounts: make(map[string][]*commonpbv4.SolanaAccountId),
 		Gets:          make(map[string]transactionpbv4.GetTransactionResponse),
 	}
 }
 
-func (t *server) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccountRequest) (*accountpbv4.CreateAccountResponse, error) {
+func (t *TestServer) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccountRequest) (*accountpbv4.CreateAccountResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -125,7 +125,7 @@ func (t *server) CreateAccount(ctx context.Context, req *accountpbv4.CreateAccou
 	}, nil
 }
 
-func (t *server) GetAccountInfo(ctx context.Context, req *accountpbv4.GetAccountInfoRequest) (*accountpbv4.GetAccountInfoResponse, error) {
+func (t *TestServer) GetAccountInfo(ctx context.Context, req *accountpbv4.GetAccountInfoRequest) (*accountpbv4.GetAccountInfoResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -145,7 +145,7 @@ func (t *server) GetAccountInfo(ctx context.Context, req *accountpbv4.GetAccount
 	}, nil
 }
 
-func (t *server) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.ResolveTokenAccountsRequest) (*accountpbv4.ResolveTokenAccountsResponse, error) {
+func (t *TestServer) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.ResolveTokenAccountsRequest) (*accountpbv4.ResolveTokenAccountsResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -186,7 +186,7 @@ func (t *server) ResolveTokenAccounts(ctx context.Context, req *accountpbv4.Reso
 	return resp, nil
 }
 
-func (t *server) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4.Account_GetEventsServer) error {
+func (t *TestServer) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4.Account_GetEventsServer) error {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -210,7 +210,7 @@ func (t *server) GetEvents(req *accountpbv4.GetEventsRequest, stream accountpbv4
 	return nil
 }
 
-func (t *server) GetServiceConfig(ctx context.Context, req *transactionpbv4.GetServiceConfigRequest) (*transactionpbv4.GetServiceConfigResponse, error) {
+func (t *TestServer) GetServiceConfig(ctx context.Context, req *transactionpbv4.GetServiceConfigRequest) (*transactionpbv4.GetServiceConfigResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -222,7 +222,7 @@ func (t *server) GetServiceConfig(ctx context.Context, req *transactionpbv4.GetS
 	return t.ServiceConfig, nil
 }
 
-func (t *server) GetMinimumKinVersion(ctx context.Context, req *transactionpbv4.GetMinimumKinVersionRequest) (*transactionpbv4.GetMinimumKinVersionResponse, error) {
+func (t *TestServer) GetMinimumKinVersion(ctx context.Context, req *transactionpbv4.GetMinimumKinVersionRequest) (*transactionpbv4.GetMinimumKinVersionResponse, error) {
 	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
@@ -230,7 +230,7 @@ func (t *server) GetMinimumKinVersion(ctx context.Context, req *transactionpbv4.
 	return &transactionpbv4.GetMinimumKinVersionResponse{Version: 4}, nil
 }
 
-func (t *server) GetRecentBlockhash(ctx context.Context, req *transactionpbv4.GetRecentBlockhashRequest) (*transactionpbv4.GetRecentBlockhashResponse, error) {
+func (t *TestServer) GetRecentBlockhash(ctx context.Context, req *transactionpbv4.GetRecentBlockhashRequest) (*transactionpbv4.GetRecentBlockhashResponse, error) {
 	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func (t *server) GetRecentBlockhash(ctx context.Context, req *transactionpbv4.Ge
 	return &transactionpbv4.GetRecentBlockhashResponse{Blockhash: &commonpbv4.Blockhash{Value: RecentBlockhash}}, nil
 }
 
-func (t *server) GetMinimumBalanceForRentExemption(ctx context.Context, req *transactionpbv4.GetMinimumBalanceForRentExemptionRequest) (*transactionpbv4.GetMinimumBalanceForRentExemptionResponse, error) {
+func (t *TestServer) GetMinimumBalanceForRentExemption(ctx context.Context, req *transactionpbv4.GetMinimumBalanceForRentExemptionRequest) (*transactionpbv4.GetMinimumBalanceForRentExemptionResponse, error) {
 	if err := validateV4Headers(ctx); err != nil {
 		return nil, err
 	}
@@ -246,11 +246,11 @@ func (t *server) GetMinimumBalanceForRentExemption(ctx context.Context, req *tra
 	return &transactionpbv4.GetMinimumBalanceForRentExemptionResponse{Lamports: MinBalanceForRentException}, nil
 }
 
-func (t *server) GetHistory(context.Context, *transactionpbv4.GetHistoryRequest) (*transactionpbv4.GetHistoryResponse, error) {
+func (t *TestServer) GetHistory(context.Context, *transactionpbv4.GetHistoryRequest) (*transactionpbv4.GetHistoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
-func (t *server) SignTransaction(ctx context.Context, req *transactionpbv4.SignTransactionRequest) (*transactionpbv4.SignTransactionResponse, error) {
+func (t *TestServer) SignTransaction(ctx context.Context, req *transactionpbv4.SignTransactionRequest) (*transactionpbv4.SignTransactionResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -293,7 +293,7 @@ func (t *server) SignTransaction(ctx context.Context, req *transactionpbv4.SignT
 	}, nil
 }
 
-func (t *server) SubmitTransaction(ctx context.Context, req *transactionpbv4.SubmitTransactionRequest) (*transactionpbv4.SubmitTransactionResponse, error) {
+func (t *TestServer) SubmitTransaction(ctx context.Context, req *transactionpbv4.SubmitTransactionRequest) (*transactionpbv4.SubmitTransactionResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -336,7 +336,7 @@ func (t *server) SubmitTransaction(ctx context.Context, req *transactionpbv4.Sub
 	}, nil
 }
 
-func (t *server) GetTransaction(ctx context.Context, req *transactionpbv4.GetTransactionRequest) (*transactionpbv4.GetTransactionResponse, error) {
+func (t *TestServer) GetTransaction(ctx context.Context, req *transactionpbv4.GetTransactionRequest) (*transactionpbv4.GetTransactionResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -357,7 +357,7 @@ func (t *server) GetTransaction(ctx context.Context, req *transactionpbv4.GetTra
 	}, nil
 }
 
-func (t *server) RequestAirdrop(ctx context.Context, req *airdrop.RequestAirdropRequest) (*airdrop.RequestAirdropResponse, error) {
+func (t *TestServer) RequestAirdrop(ctx context.Context, req *airdrop.RequestAirdropRequest) (*airdrop.RequestAirdropResponse, error) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -385,7 +385,7 @@ func (t *server) RequestAirdrop(ctx context.Context, req *airdrop.RequestAirdrop
 	}, nil
 }
 
-func (t *server) SetError(err error, n int) {
+func (t *TestServer) SetError(err error, n int) {
 	t.Mux.Lock()
 	defer t.Mux.Unlock()
 
@@ -395,7 +395,7 @@ func (t *server) SetError(err error, n int) {
 	}
 }
 
-func (t *server) GetError() error {
+func (t *TestServer) GetError() error {
 	if len(t.Errors) == 0 {
 		return nil
 	}
